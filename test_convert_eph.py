@@ -1615,3 +1615,596 @@ class TestPyubx2CrossValidation:
         assert parsed.N == 771
         assert parsed.tauC == pytest.approx(glut['a0'], abs=2**-27)
         assert parsed.tauGps == pytest.approx(glgp['a0'], abs=2**-31)
+
+    def test_mga_gal_eph(self):
+        """Build Galileo EPH from RINEX-like values, parse with pyubx2."""
+        epoch = {
+            'IODnav': 77.0, 'health': 0.0, 'SISA': 3.12,
+            'Toe': 14400.0, 'BGDe5b': -4.656612873e-10,
+            'SVclockDriftRate': 0.0, 'SVclockDrift': -6.594e-12,
+            'SVclockBias': -1.062e-04, 'BGDe5a': 0.0,
+            'DataSrc': 516.0, 'GALWeek': 1357.0,
+            'Crs': -124.0625, 'DeltaN': 4.245e-09, 'M0': 2.828,
+            'Cuc': -6.488e-06, 'Eccentricity': 1.493e-03, 'Cus': -7.084e-06,
+            'sqrtA': 5440.600,
+            'Cic': -2.794e-08, 'Omega0': -2.538, 'Cis': -2.980e-08,
+            'Io': 0.986, 'Crc': 193.656, 'omega': -1.025,
+            'OmegaDot': -7.940e-09, 'IDOT': -7.210e-11,
+            'spare0': 0.0, 'spare1': 0.0, 'TransTime': 0.0,
+        }
+        msg_bytes = convert_eph.convert_gal_epoch(1, epoch, 14400.0)
+        _, _, payload = parse_ubx_frame(msg_bytes)
+        parsed = UBXMessage(0x13, 0x02, SET, payload=payload)
+
+        assert parsed.identity == "MGA-GAL-EPH"
+        assert parsed.svId == 1
+        assert parsed.iodNav == 77
+        # toe: 14400/60 = 240 raw, *60 = 14400 back
+        assert parsed.toe == pytest.approx(14400.0)
+        # toc: 14400/60 = 240 raw, *60 = 14400 back
+        assert parsed.toc == pytest.approx(14400.0)
+        # af0: scale 2^-34
+        assert parsed.af0 == pytest.approx(-1.062e-04, rel=1e-4)
+        # af1: scale 2^-46, I4
+        assert parsed.af1 == pytest.approx(-6.594e-12, rel=1e-4)
+        assert parsed.sqrtA == pytest.approx(5440.600, rel=1e-6)
+        assert parsed.e == pytest.approx(1.493e-03, rel=1e-4)
+        # m0 in semi-circles
+        assert parsed.m0 == pytest.approx(2.828 / math.pi, rel=1e-6)
+        assert parsed.healthE1B == 0
+        assert parsed.dataValidityE1B == 0
+        assert parsed.healthE5b == 0
+        assert parsed.dataValidityE5b == 0
+
+
+# ============================================================
+# Galileo SISA index lookup
+# ============================================================
+
+class TestSisaMetersToIndex:
+    def test_zero(self):
+        assert convert_eph.sisa_meters_to_index(0.0) == 0
+
+    def test_exact_1cm(self):
+        assert convert_eph.sisa_meters_to_index(0.01) == 1
+
+    def test_exact_49cm(self):
+        assert convert_eph.sisa_meters_to_index(0.49) == 49
+
+    def test_exact_50cm(self):
+        """50 cm is first value of 2cm step range."""
+        assert convert_eph.sisa_meters_to_index(0.50) == 50
+
+    def test_exact_98cm(self):
+        """98 cm = 50 + (74-50)*2 -> index 74."""
+        assert convert_eph.sisa_meters_to_index(0.98) == 74
+
+    def test_exact_100cm(self):
+        """100 cm = first value of 4cm step range -> index 75."""
+        assert convert_eph.sisa_meters_to_index(1.00) == 75
+
+    def test_exact_196cm(self):
+        """196 cm = 100 + (99-75)*4 -> index 99."""
+        assert convert_eph.sisa_meters_to_index(1.96) == 99
+
+    def test_exact_200cm(self):
+        """200 cm = first value of 16cm step range -> index 100."""
+        assert convert_eph.sisa_meters_to_index(2.00) == 100
+
+    def test_typical_312cm(self):
+        """3.12m = 312 cm -> index 100 + round((312-200)/16) = 107."""
+        assert convert_eph.sisa_meters_to_index(3.12) == 107
+
+    def test_exact_600cm(self):
+        """600 cm = 200 + (125-100)*16 -> index 125."""
+        assert convert_eph.sisa_meters_to_index(6.00) == 125
+
+    def test_above_max(self):
+        """Values above 600 cm -> NAPA (255)."""
+        assert convert_eph.sisa_meters_to_index(10.0) == 255
+
+    def test_nan_returns_napa(self):
+        assert convert_eph.sisa_meters_to_index(float('nan')) == 255
+
+    def test_negative(self):
+        assert convert_eph.sisa_meters_to_index(-1.0) == 0
+
+
+# ============================================================
+# Galileo MGA-GAL-EPH message building
+# ============================================================
+
+class TestRinexEpochToMgaGalEph:
+    """Test the RINEX epoch -> raw integer dict conversion for Galileo."""
+
+    def _make_epoch(self):
+        return {
+            'IODnav': 77.0, 'health': 0.0, 'SISA': 3.12,
+            'Toe': 14400.0, 'BGDe5b': -4.656612873e-10,
+            'SVclockDriftRate': 0.0, 'SVclockDrift': -6.594e-12,
+            'SVclockBias': -1.062e-04, 'BGDe5a': 0.0,
+            'DataSrc': 516.0, 'GALWeek': 1357.0,
+            'Crs': 0.0, 'DeltaN': 0.0, 'M0': 0.0,
+            'Cuc': 0.0, 'Eccentricity': 0.01, 'Cus': 0.0,
+            'sqrtA': 5440.600,
+            'Cic': 0.0, 'Omega0': 0.0, 'Cis': 0.0,
+            'Io': 0.0, 'Crc': 0.0, 'omega': 0.0,
+            'OmegaDot': 0.0, 'IDOT': 0.0,
+            'spare0': 0.0, 'spare1': 0.0, 'TransTime': 0.0,
+        }
+
+    def test_iod_nav(self):
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['iodNav'] == 77
+
+    def test_toe_scaling_60s(self):
+        """Toe=14400s, LSB=60 -> 14400/60 = 240."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['toe'] == 240
+
+    def test_toc_scaling_60s(self):
+        """Toc=14400s, LSB=60 -> 14400/60 = 240."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['toc'] == 240
+
+    def test_af0_scaling(self):
+        """af0: scale 2^-34 for Galileo (not 2^-31 like GPS)."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        expected = round(-1.062e-04 / 2**-34)
+        assert raw['af0'] == expected
+
+    def test_af1_scaling(self):
+        """af1: scale 2^-46 for Galileo, I4 (not 2^-43 I2 like GPS)."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        expected = round(-6.594e-12 / 2**-46)
+        assert raw['af1'] == expected
+
+    def test_af2_scaling(self):
+        """af2: scale 2^-59 for Galileo (not 2^-55 like GPS)."""
+        epoch = self._make_epoch()
+        epoch['SVclockDriftRate'] = 2**-59  # exact 1 LSB
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, epoch, 14400.0)
+        assert raw['af2'] == 1
+
+    def test_bgd_e1e5b_scaling(self):
+        """BGDe5b: scale 2^-32, I2."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        expected = round(-4.656612873e-10 / 2**-32)
+        assert raw['bgdE1E5b'] == expected
+
+    def test_sisa_index(self):
+        """SISA=3.12m -> index 107."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['sisaIndex'] == 107
+
+    def test_health_decomposition_healthy(self):
+        """Health=0 -> all zero."""
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['healthE1B'] == 0
+        assert raw['dataValidityE1B'] == 0
+        assert raw['healthE5b'] == 0
+        assert raw['dataValidityE5b'] == 0
+
+    def test_health_decomposition_e1b(self):
+        """Health with E1B status bits set."""
+        epoch = self._make_epoch()
+        epoch['health'] = 0x07  # bits 0-2: dataValidity=1, healthE1B=3
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, epoch, 14400.0)
+        assert raw['dataValidityE1B'] == 1    # bit 0
+        assert raw['healthE1B'] == 3           # bits 1-2
+
+    def test_health_decomposition_e5b(self):
+        """Health with E5b status bits set."""
+        epoch = self._make_epoch()
+        epoch['health'] = 0x1C0  # bits 6-8: dataValidityE5b=1, healthE5b=3
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, epoch, 14400.0)
+        assert raw['dataValidityE5b'] == 1    # bit 6
+        assert raw['healthE5b'] == 3           # bits 7-8
+
+    def test_eccentricity_unsigned(self):
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(1, self._make_epoch(), 14400.0)
+        assert raw['e'] > 0
+
+    def test_sv_id_passthrough(self):
+        raw = convert_eph.rinex_epoch_to_mga_gal_eph(25, self._make_epoch(), 14400.0)
+        assert raw['sv_id'] == 25
+
+
+class TestBuildMgaGalEphPayload:
+    """Test the 76-byte MGA-GAL-EPH payload builder."""
+
+    def _make_raw_dict(self):
+        return {
+            'sv_id': 1,
+            'iodNav': 77,
+            'deltaN': 922,
+            'm0': 1352061001,
+            'e': 3205500,
+            'sqrtA': 2856591360,
+            'omega0': -1213792850,
+            'i0': 528513960,
+            'omega': -490455982,
+            'omegaDot': -17260,
+            'idot': -157,
+            'cuc': -346,
+            'cus': -378,
+            'crc': 6197,
+            'crs': -3970,
+            'cic': -15,
+            'cis': -16,
+            'toe': 240,
+            'af0': -1826489,
+            'af1': -94,
+            'af2': 0,
+            'sisaIndex': 107,
+            'toc': 240,
+            'bgdE1E5b': -2,
+            'healthE1B': 0,
+            'dataValidityE1B': 0,
+            'healthE5b': 0,
+            'dataValidityE5b': 0,
+        }
+
+    def test_payload_length(self):
+        raw = self._make_raw_dict()
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert len(payload) == 76
+
+    def test_type_byte(self):
+        raw = self._make_raw_dict()
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[0] == 0x01  # type
+
+    def test_version_byte(self):
+        raw = self._make_raw_dict()
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[1] == 0x00  # version
+
+    def test_sv_id(self):
+        raw = self._make_raw_dict()
+        raw['sv_id'] = 25
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[2] == 25
+
+    def test_iodnav_encoding(self):
+        raw = self._make_raw_dict()
+        raw['iodNav'] = 77
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        iodnav = struct.unpack('<H', payload[4:6])[0]
+        assert iodnav == 77
+
+    def test_reserved_fields_zero(self):
+        raw = self._make_raw_dict()
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[3] == 0x00   # reserved0
+        # reserved1 at offset 66 (U2)
+        assert payload[66:68] == b'\x00\x00'
+        # reserved2 at offset 72 (U4)
+        assert payload[72:76] == b'\x00\x00\x00\x00'
+
+    def test_toe_at_correct_offset(self):
+        """toe is U2 at offset 50.
+
+        Layout: type(1)+ver(1)+svId(1)+res0(1)+iodNav(2)+deltaN(2)+m0(4)
+        +e(4)+sqrtA(4)+omega0(4)+i0(4)+omega(4)+omegaDot(4)
+        +iDot(2)+cuc(2)+cus(2)+crc(2)+crs(2)+cic(2)+cis(2) = 50
+        """
+        raw = self._make_raw_dict()
+        raw['toe'] = 240
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        toe = struct.unpack('<H', payload[50:52])[0]
+        assert toe == 240
+
+    def test_af0_at_correct_offset(self):
+        """af0 is I4 at offset 52."""
+        raw = self._make_raw_dict()
+        raw['af0'] = -1826489
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        af0 = struct.unpack('<i', payload[52:56])[0]
+        assert af0 == -1826489
+
+    def test_af1_at_correct_offset(self):
+        """af1 is I4 at offset 56 (not I2 like GPS!)."""
+        raw = self._make_raw_dict()
+        raw['af1'] = -94
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        af1 = struct.unpack('<i', payload[56:60])[0]
+        assert af1 == -94
+
+    def test_sisa_and_toc_offsets(self):
+        """sisaIndex (U1) at 61, toc (U2) at 62."""
+        raw = self._make_raw_dict()
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[61] == 107   # sisaIndex
+        toc = struct.unpack('<H', payload[62:64])[0]
+        assert toc == 240           # toc
+
+    def test_bgd_encoding(self):
+        """bgdE1E5b (I2) at offset 64."""
+        raw = self._make_raw_dict()
+        raw['bgdE1E5b'] = -2
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        bgd = struct.unpack('<h', payload[64:66])[0]
+        assert bgd == -2
+
+    def test_health_fields(self):
+        """Health fields at offsets 68-71."""
+        raw = self._make_raw_dict()
+        raw['healthE1B'] = 1
+        raw['dataValidityE1B'] = 1
+        raw['healthE5b'] = 2
+        raw['dataValidityE5b'] = 1
+        payload = convert_eph.build_mga_gal_eph_payload(raw)
+        assert payload[68] == 1  # healthE1B
+        assert payload[69] == 1  # dataValidityE1B
+        assert payload[70] == 2  # healthE5b
+        assert payload[71] == 1  # dataValidityE5b
+
+
+# ============================================================
+# Galileo supplementary message builders
+# ============================================================
+
+class TestBuildMgaGalTimeoffset:
+    def test_message_structure(self):
+        gagp = {'a0': -3.49e-09, 'a1': 0.0, 'tot': 122400, 'wnt': 2405}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        cls_id, msg_id, payload = parse_ubx_frame(msg)
+        assert cls_id == 0x13
+        assert msg_id == 0x02  # GAL
+        assert len(payload) == 10
+
+    def test_type_byte(self):
+        gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        assert payload[0] == 0x03  # type = TIMEOFFSET
+
+    def test_version_and_reserved(self):
+        gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        assert payload[1] == 0x00  # version
+        assert payload[2:4] == b'\x00\x00'  # reserved0
+
+    def test_a0g_encoding(self):
+        """a0G: I2 scaled 2^-35."""
+        a0 = -3 * 2**-35  # exact -> raw = -3
+        gagp = {'a0': a0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        a0g_raw = struct.unpack('<h', payload[4:6])[0]
+        assert a0g_raw == -3
+
+    def test_a1g_encoding(self):
+        """a1G: I2 scaled 2^-51."""
+        a1 = 5 * 2**-51  # exact -> raw = 5
+        gagp = {'a0': 0.0, 'a1': a1, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        a1g_raw = struct.unpack('<h', payload[6:8])[0]
+        assert a1g_raw == 5
+
+    def test_t0g_encoding(self):
+        """t0G: U1, in units of 3600 seconds."""
+        gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 122400, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        # 122400 / 3600 = 34
+        assert payload[8] == 34
+
+    def test_wn0g_encoding(self):
+        """wn0G: U1, 8-bit truncated week."""
+        gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 2405}
+        msg = convert_eph.build_mga_gal_timeoffset(gagp)
+        _, _, payload = parse_ubx_frame(msg)
+        assert payload[9] == 2405 & 0xFF
+
+
+class TestBuildMgaGalUtc:
+    def test_message_structure(self):
+        gaut = {'a0': -9.3132e-10, 'a1': 0.0, 'tot': 405504, 'wnt': 2405}
+        msg = convert_eph.build_mga_gal_utc(gaut, 18)
+        cls_id, msg_id, payload = parse_ubx_frame(msg)
+        assert cls_id == 0x13
+        assert msg_id == 0x02  # GAL
+        assert len(payload) == 20
+
+    def test_type_byte(self):
+        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 0)
+        _, _, payload = parse_ubx_frame(msg)
+        assert payload[0] == 0x05  # type = UTC
+
+    def test_a0_encoding(self):
+        """utcA0: I4 scaled 2^-30."""
+        a0 = -1 * 2**-30  # exact -> raw = -1
+        gaut = {'a0': a0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 0)
+        _, _, payload = parse_ubx_frame(msg)
+        a0_raw = struct.unpack('<i', payload[4:8])[0]
+        assert a0_raw == -1
+
+    def test_a1_encoding(self):
+        """utcA1: I4 scaled 2^-50."""
+        a1 = 3 * 2**-50
+        gaut = {'a0': 0.0, 'a1': a1, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 0)
+        _, _, payload = parse_ubx_frame(msg)
+        a1_raw = struct.unpack('<i', payload[8:12])[0]
+        assert a1_raw == 3
+
+    def test_leap_seconds_encoding(self):
+        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 18)
+        _, _, payload = parse_ubx_frame(msg)
+        dtLS = struct.unpack('b', payload[12:13])[0]
+        assert dtLS == 18
+
+    def test_tot_encoding(self):
+        """utcTot: U1 scaled 2^12 (4096s)."""
+        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 405504, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 0)
+        _, _, payload = parse_ubx_frame(msg)
+        assert payload[13] == 99  # 405504/4096 = 99
+
+    def test_dtlsf_mirrors_dtls(self):
+        """Future leap second should equal current."""
+        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
+        msg = convert_eph.build_mga_gal_utc(gaut, 18)
+        _, _, payload = parse_ubx_frame(msg)
+        dtLS = struct.unpack('b', payload[12:13])[0]
+        dtLSF = struct.unpack('b', payload[17:18])[0]
+        assert dtLS == dtLSF == 18
+
+
+# ============================================================
+# RINEX 3 Galileo parser
+# ============================================================
+
+class TestRinex3GalParser:
+    """Test RINEX 3 Galileo record parsing with embedded data."""
+
+    GAL_RECORD = [
+        "E01 2026 02 10 00 10 00-7.564918976277E-04-6.394884621841E-12 0.000000000000E+00\n",
+        "     7.700000000000E+01 1.393750000000E+01 2.649484508262E-09 2.690457236932E+00\n",
+        "     7.376074790955E-07 1.646387972869E-04 1.032464206219E-05 5.440588268280E+03\n",
+        "     8.760000000000E+04 5.587935447693E-08 2.855773754591E+00-3.166496753693E-08\n",
+        "     9.829497879629E-01 1.535625000000E+02-6.766953849610E-01-5.238527953445E-09\n",
+        "    -3.428681507379E-10 5.160000000000E+02 1.357000000000E+03 0.000000000000E+00\n",
+        "     3.120000000000E+00 0.000000000000E+00-4.656612873077E-10-5.122274160385E-10\n",
+        "     8.826400000000E+04 0.000000000000E+00                                      \n",
+    ]
+
+    def test_gal_record_parsing(self):
+        """Parse a Galileo RINEX 3 record with GAL field names."""
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        assert result is not None
+        sv_label, epoch, _ = result
+        assert sv_label == "E01"
+        assert epoch == np.datetime64('2026-02-10T00:10:00', 'ns')
+
+    def test_gal_iodnav_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['IODnav'] == pytest.approx(77.0)
+
+    def test_gal_sisa_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['SISA'] == pytest.approx(3.12)
+
+    def test_gal_bgd_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['BGDe5b'] == pytest.approx(-5.122274160385e-10)
+        assert fields['BGDe5a'] == pytest.approx(-4.656612873077e-10)
+
+    def test_gal_sqrtA_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['sqrtA'] == pytest.approx(5440.588268280)
+
+    def test_gal_datasrc_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['DataSrc'] == pytest.approx(516.0)
+
+    def test_gal_galweek_field(self):
+        result = convert_eph._parse_rinex3_nav_record(
+            self.GAL_RECORD, 'E', field_names=convert_eph.RINEX3_GAL_FIELDS)
+        _, _, fields = result
+        assert fields['GALWeek'] == pytest.approx(1357.0)
+
+    def test_parse_rinex3_nav_with_galileo(self):
+        """Test parse_rinex3_nav extracts Galileo records."""
+        header = (
+            "     3.05           N: GNSS NAV DATA    M: Mixed            RINEX VERSION / TYPE\n"
+            "                                                            END OF HEADER\n"
+        )
+        content = header + "".join(self.GAL_RECORD)
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.rnx', delete=False)
+        tmp.write(content)
+        tmp.close()
+        try:
+            ds = convert_eph.parse_rinex3_nav(tmp.name, systems='E')
+            assert ds is not None
+            svs = [str(s) for s in ds.coords['sv'].values]
+            assert 'E01' in svs
+            assert 'IODnav' in ds.data_vars
+            assert 'SISA' in ds.data_vars
+            assert 'BGDe5b' in ds.data_vars
+            val = float(ds['sqrtA'].sel(sv='E01').values[0])
+            assert val == pytest.approx(5440.588268280)
+        finally:
+            os.unlink(tmp.name)
+
+
+# ============================================================
+# Galileo integration tests with real data
+# ============================================================
+
+class TestGalileoIntegration:
+    """Integration tests with real RINEX 3 data containing Galileo."""
+
+    IGS_MIXED = os.path.join(_TESTDATA, "BRDC00WRD_R_20260410000_01D_MN.rnx.gz")
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.igs_file = None
+        if os.path.exists(self.IGS_MIXED):
+            import gzip
+            import shutil
+            out = tmp_path / "BRDC00WRD_R_20260410000_01D_MN.rnx"
+            with gzip.open(self.IGS_MIXED, 'rb') as f_in, open(out, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            if out.exists():
+                self.igs_file = str(out)
+
+    @pytest.mark.skipif(
+        not os.path.exists(os.path.join(_TESTDATA, "BRDC00WRD_R_20260410000_01D_MN.rnx.gz")),
+        reason="IGS RINEX test file not available")
+    def test_galileo_svs_loaded(self):
+        """Test that Galileo SVs are loaded from mixed RINEX 3."""
+        ds = convert_eph.load_rinex_nav(self.igs_file)
+        assert ds is not None
+        svs = [str(s) for s in ds.coords['sv'].values]
+        e_count = sum(1 for s in svs if s.startswith('E'))
+        assert e_count >= 20
+
+    @pytest.mark.skipif(
+        not os.path.exists(os.path.join(_TESTDATA, "BRDC00WRD_R_20260410000_01D_MN.rnx.gz")),
+        reason="IGS RINEX test file not available")
+    def test_galileo_conversion(self):
+        """Test Galileo ephemeris conversion produces msg_id=0x02."""
+        ds = convert_eph.load_rinex_nav(self.igs_file)
+        results = convert_eph.convert_rinex(ds, systems={'GAL'})
+        assert len(results) >= 20
+
+        for _, msg_bytes, _, _ in results:
+            cls_id, msg_id, payload = parse_ubx_frame(msg_bytes)
+            assert cls_id == 0x13
+            assert msg_id == 0x02  # MGA-GAL
+            assert len(payload) == 76
+
+    @pytest.mark.skipif(
+        not os.path.exists(os.path.join(_TESTDATA, "BRDC00WRD_R_20260410000_01D_MN.rnx.gz")),
+        reason="IGS RINEX test file not available")
+    def test_full_conversion_includes_galileo(self):
+        """Test full conversion includes GPS, GLONASS, and Galileo."""
+        ds = convert_eph.load_rinex_nav(self.igs_file)
+        results = convert_eph.convert_rinex(ds)
+        msg_ids = set()
+        for _, msg_bytes, _, _ in results:
+            _, msg_id, _ = parse_ubx_frame(msg_bytes)
+            msg_ids.add(msg_id)
+        assert 0x00 in msg_ids  # GPS
+        assert 0x02 in msg_ids  # Galileo
+        assert 0x06 in msg_ids  # GLONASS
