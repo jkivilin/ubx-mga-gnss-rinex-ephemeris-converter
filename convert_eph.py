@@ -2,8 +2,8 @@
 """
 convert_eph.py -- Convert RINEX navigation files to u-blox MGA assistance messages.
 
-Reads RINEX 2/3 GPS, QZSS, and GLONASS navigation files and produces UBX binary
-files containing MGA ephemeris (EPH), health, ionosphere, UTC, and time offset
+Reads RINEX 2/3 GPS, QZSS, GLONASS, and Galileo navigation files and produces UBX
+binary files containing MGA ephemeris (EPH), health, ionosphere, UTC, and time offset
 messages for assisted GNSS startup.
 
 Dependencies: georinex, numpy
@@ -11,7 +11,7 @@ Dependencies: georinex, numpy
 Usage:
   convert_eph.py brdc0380.26n -o eph.ubx
   convert_eph.py brdc0380.26n -o eph.ubx --time 2026-02-07T16:00
-  convert_eph.py brdc0380.26n -o eph.ubx --systems GPS,QZSS
+  convert_eph.py brdc0380.26n -o eph.ubx --systems GPS,QZSS,GAL
 """
 
 import argparse
@@ -223,6 +223,17 @@ def parse_rinex2_nav(filepath):
 # Field order is identical to RINEX 2 for GPS/QZSS
 RINEX3_NAV_FIELDS = RINEX2_NAV_FIELDS
 
+# Galileo field order (different from GPS in lines 5-8)
+RINEX3_GAL_FIELDS = [
+    'IODnav', 'Crs', 'DeltaN', 'M0',
+    'Cuc', 'Eccentricity', 'Cus', 'sqrtA',
+    'Toe', 'Cic', 'Omega0', 'Cis',
+    'Io', 'Crc', 'omega', 'OmegaDot',
+    'IDOT', 'DataSrc', 'GALWeek', 'spare0',
+    'SISA', 'health', 'BGDe5a', 'BGDe5b',
+    'TransTime', 'spare1',
+]
+
 
 def _parse_rinex3_float(s):
     """Parse RINEX 3 float value (lowercase or uppercase exponent)."""
@@ -233,8 +244,9 @@ def _parse_rinex3_float(s):
     return float(s)
 
 
-def _parse_rinex3_nav_record(lines, allowed_systems='GJ'):
-    """Parse one RINEX 3 GPS/QZSS navigation record (8 lines).
+def _parse_rinex3_nav_record(lines, allowed_systems='GJ',
+                             field_names=None):
+    """Parse one RINEX 3 GPS/QZSS/Galileo navigation record (8 lines).
 
     RINEX 3 format:
       SV line: X## YYYY MM DD HH MM SS af0(D19.12) af1(D19.12) af2(D19.12)
@@ -242,6 +254,8 @@ def _parse_rinex3_nav_record(lines, allowed_systems='GJ'):
 
     Returns: (sv_label, epoch_dt64, field_dict) or None on error/skip.
     """
+    if field_names is None:
+        field_names = RINEX3_NAV_FIELDS
     header = lines[0].rstrip('\n')
     if len(header) < 23:
         return None
@@ -284,9 +298,9 @@ def _parse_rinex3_nav_record(lines, allowed_systems='GJ'):
         for col in range(4):
             start = 4 + col * 19
             end = start + 19
-            if field_idx < len(RINEX3_NAV_FIELDS):
+            if field_idx < len(field_names):
                 val_str = line[start:end] if end <= len(line) else ''
-                fields[RINEX3_NAV_FIELDS[field_idx]] = _parse_rinex3_float(val_str)
+                fields[field_names[field_idx]] = _parse_rinex3_float(val_str)
                 field_idx += 1
 
     return sv_label, epoch, fields
@@ -386,8 +400,8 @@ def _detect_rinex_version(filepath):
 def parse_rinex3_nav(filepath, systems='GJ'):
     """Parse RINEX 3 navigation file manually, extracting only specified systems.
 
-    Supports GPS (G), QZSS (J), and GLONASS (R) records.
-    GPS/QZSS records are 8 lines; GLONASS records are 4 lines.
+    Supports GPS (G), QZSS (J), GLONASS (R), and Galileo (E) records.
+    GPS/QZSS/Galileo records are 8 lines; GLONASS records are 4 lines.
 
     Returns xarray Dataset compatible with georinex output, or None.
     """
@@ -407,9 +421,10 @@ def parse_rinex3_nav(filepath, systems='GJ'):
 
     data_lines = all_lines[header_end:]
 
-    # Separate GPS/QZSS and GLONASS records (they have different field structures)
+    # Separate records by field structure (GPS/QZSS, GLONASS, Galileo)
     gj_records = []
     glo_records = []
+    gal_records = []
     i = 0
     while i < len(data_lines):
         line = data_lines[i]
@@ -430,6 +445,12 @@ def parse_rinex3_nav(filepath, systems='GJ'):
                 result = _parse_rinex3_glo_record(data_lines[i:i+n_lines])
                 if result:
                     glo_records.append(result)
+            elif sys_char == 'E':
+                result = _parse_rinex3_nav_record(
+                    data_lines[i:i+n_lines], systems,
+                    field_names=RINEX3_GAL_FIELDS)
+                if result:
+                    gal_records.append(result)
             elif sys_char in ('G', 'J'):
                 result = _parse_rinex3_nav_record(data_lines[i:i+n_lines], systems)
                 if result:
@@ -454,6 +475,31 @@ def parse_rinex3_nav(filepath, systems='GJ'):
         sv_idx = {sv: i for i, sv in enumerate(sv_set)}
         time_idx = {t: i for i, t in enumerate(time_set)}
         for sv_label, epoch, fields in gj_records:
+            si = sv_idx[sv_label]
+            ti = time_idx[epoch]
+            for field_name, value in fields.items():
+                if field_name in data_vars:
+                    data_vars[field_name][1][ti, si] = value
+        datasets.append(xr.Dataset(
+            data_vars=data_vars,
+            coords={'time': time_arr, 'sv': sv_arr},
+        ))
+
+    # Build Galileo dataset
+    if gal_records:
+        all_gal_fields = (['SVclockBias', 'SVclockDrift',
+                           'SVclockDriftRate'] + RINEX3_GAL_FIELDS)
+        sv_set = sorted(set(r[0] for r in gal_records))
+        time_set = sorted(set(r[1] for r in gal_records))
+        sv_arr = np.array(sv_set)
+        time_arr = np.array(time_set)
+        data_vars = {}
+        for field in all_gal_fields:
+            data_vars[field] = (['time', 'sv'],
+                                np.full((len(time_arr), len(sv_arr)), np.nan))
+        sv_idx = {sv: i for i, sv in enumerate(sv_set)}
+        time_idx = {t: i for i, t in enumerate(time_set)}
+        for sv_label, epoch, fields in gal_records:
             si = sv_idx[sv_label]
             ti = time_idx[epoch]
             for field_name, value in fields.items():
@@ -500,6 +546,68 @@ def parse_rinex3_nav(filepath, systems='GJ'):
         return xr.merge(datasets, join='outer')
 
 
+def _deduplicate_galileo_svs(nav_gal):
+    """Deduplicate Galileo I/NAV vs F/NAV SVs from georinex.
+
+    georinex may produce E01 and E01_1 for I/NAV and F/NAV data.
+    Prefer I/NAV (DataSrc bit 0 set) for correct BGDe5b values.
+    """
+    svs = [str(s) for s in nav_gal.coords['sv'].values]
+    # Find base SVs that have _N duplicates
+    base_svs = set()
+    suffixed = {}
+    for sv in svs:
+        if '_' in sv:
+            base = sv.split('_')[0]
+            suffixed[base] = sv
+            base_svs.add(base)
+
+    if not base_svs:
+        return nav_gal  # No duplicates
+
+    drop_svs = []
+    rename_svs = {}
+    for base in base_svs:
+        if base not in svs:
+            # Base not present, just rename suffixed -> base
+            rename_svs[suffixed[base]] = base
+            continue
+        # Both base and suffixed exist -- check DataSrc to pick I/NAV
+        base_data = nav_gal.sel(sv=base)
+        suf_data = nav_gal.sel(sv=suffixed[base])
+        # Check DataSrc: bit 0 set = I/NAV (E1-B)
+        base_dsrc = 0
+        suf_dsrc = 0
+        if 'DataSrc' in nav_gal.data_vars:
+            base_vals = base_data['DataSrc'].values
+            suf_vals = suf_data['DataSrc'].values
+            base_dsrc = int(np.nanmean(base_vals[~np.isnan(base_vals)])) if np.any(~np.isnan(base_vals)) else 0
+            suf_dsrc = int(np.nanmean(suf_vals[~np.isnan(suf_vals)])) if np.any(~np.isnan(suf_vals)) else 0
+        if suf_dsrc & 0x01 and not base_dsrc & 0x01:
+            # Suffixed is I/NAV, drop base and rename suffixed
+            drop_svs.append(base)
+            rename_svs[suffixed[base]] = base
+        else:
+            # Base is I/NAV (or both are), drop suffixed
+            drop_svs.append(suffixed[base])
+
+    # Also drop any remaining suffixed SVs without a base
+    for sv in svs:
+        if '_' in sv and sv not in drop_svs and sv not in rename_svs:
+            drop_svs.append(sv)
+
+    if drop_svs:
+        keep = [sv for sv in svs if sv not in drop_svs]
+        nav_gal = nav_gal.sel(sv=keep)
+
+    if rename_svs:
+        sv_values = [str(s) for s in nav_gal.coords['sv'].values]
+        new_svs = [rename_svs.get(sv, sv) for sv in sv_values]
+        nav_gal = nav_gal.assign_coords(sv=new_svs)
+
+    return nav_gal
+
+
 def load_rinex_nav(filepath):
     """Load RINEX navigation file, with fallback for formats georinex can't handle.
 
@@ -508,8 +616,10 @@ def load_rinex_nav(filepath):
       - RINEX 2.x QZSS-only files (e.g. brdc0380.26q from QZSS Japan)
       - RINEX 3.x mixed multi-GNSS files (e.g. BRDC00WRD from IGS)
       - GLONASS (R##) from RINEX 3.x mixed files
+      - Galileo (E##) from RINEX 3.x mixed files
 
-    Returns xarray Dataset with GPS (G##), QZSS (J##), and/or GLONASS (R##) satellites.
+    Returns xarray Dataset with GPS (G##), QZSS (J##), GLONASS (R##),
+    and/or Galileo (E##) satellites.
     """
     major_ver, _ = _detect_rinex_version(filepath)
 
@@ -562,6 +672,23 @@ def load_rinex_nav(filepath):
         if nav_glo is not None:
             parts.append(nav_glo)
 
+        # Galileo: try georinex first, fall back to manual parser
+        nav_gal = None
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                nav_gal = gr.load(filepath, use='E')
+            if len(nav_gal.coords.get('sv', [])) == 0:
+                nav_gal = None
+        except Exception:
+            nav_gal = None
+        if nav_gal is not None:
+            nav_gal = _deduplicate_galileo_svs(nav_gal)
+        if nav_gal is None:
+            nav_gal = parse_rinex3_nav(filepath, systems='E')
+        if nav_gal is not None:
+            parts.append(nav_gal)
+
         if parts:
             if len(parts) == 1:
                 nav = parts[0]
@@ -573,7 +700,7 @@ def load_rinex_nav(filepath):
                 return nav
 
         # Everything failed -- try full manual parser for all systems
-        nav = parse_rinex3_nav(filepath, systems='GJR')
+        nav = parse_rinex3_nav(filepath, systems='GJRE')
         if nav is not None and len(nav.coords.get('sv', [])) > 0:
             return nav
 
@@ -649,6 +776,34 @@ def ura_meters_to_index(ura_m):
         if ura_m <= threshold:
             return i
     return 15
+
+
+def sisa_meters_to_index(sisa_m):
+    """Convert Galileo SISA accuracy in meters to SISA index (0-255).
+
+    Per Galileo OS-SIS-ICD Table 76:
+      Index 0-49:   0-49 cm in 1 cm steps
+      Index 50-74:  50-98 cm in 2 cm steps
+      Index 75-99:  100-196 cm in 4 cm steps
+      Index 100-125: 200-600 cm in 16 cm steps
+      Index 255:    NAPA (No Accuracy Prediction Available)
+    """
+    if np.isnan(sisa_m):
+        return 255  # NAPA
+    sisa_cm = sisa_m * 100.0
+    if sisa_cm < 0:
+        idx = 0
+    elif sisa_cm <= 49:
+        idx = max(0, min(49, round(sisa_cm)))
+    elif sisa_cm <= 98:
+        idx = max(50, min(74, 50 + round((sisa_cm - 50) / 2)))
+    elif sisa_cm <= 196:
+        idx = max(75, min(99, 75 + round((sisa_cm - 100) / 4)))
+    elif sisa_cm <= 600:
+        idx = max(100, min(125, 100 + round((sisa_cm - 200) / 16)))
+    else:
+        idx = 255  # NAPA
+    return idx
 
 
 # ---- Scaling: RINEX SI -> UBX raw integers ----
@@ -857,6 +1012,155 @@ def convert_epoch(sv_id, epoch_data, toc_seconds, msg_id):
     raw = rinex_epoch_to_mga_eph(sv_id, epoch_data, toc_seconds)
     payload = build_mga_eph_payload(raw)
     return create_ubx_message(0x13, msg_id, payload)
+
+
+# ---- Build MGA-GAL-EPH payload ----
+
+def rinex_epoch_to_mga_gal_eph(sv_id, epoch_data, toc_seconds):
+    """Convert one RINEX Galileo ephemeris epoch to MGA-GAL-EPH raw integers.
+
+    Args:
+        sv_id: Galileo PRN number (1-36)
+        epoch_data: dict-like with RINEX Galileo field values (floats)
+        toc_seconds: Toc in seconds of GPS week
+
+    Returns:
+        dict of raw integer values ready for build_mga_gal_eph_payload()
+    """
+    # IODnav: direct integer (10-bit, U2)
+    iod_nav = int(epoch_data['IODnav'])
+
+    # Health decomposition from RINEX 'health' bitmask
+    health = int(epoch_data['health'])
+    health_e1b = (health >> 1) & 0x03
+    data_validity_e1b = health & 0x01
+    health_e5b = (health >> 7) & 0x03
+    data_validity_e5b = (health >> 6) & 0x01
+
+    # SISA index
+    sisa_index = sisa_meters_to_index(epoch_data['SISA'])
+
+    # Time fields: LSB = 60s for Galileo (not 16s like GPS)
+    toc_raw = scale_unsigned(toc_seconds, 60, 16)
+    toe_raw = scale_unsigned(epoch_data['Toe'], 60, 16)
+
+    # Clock parameters (different scales from GPS)
+    af0_raw = scale_signed(epoch_data['SVclockBias'], 2**-34, 32)    # I4
+    af1_raw = scale_signed(epoch_data['SVclockDrift'], 2**-46, 32)   # I4 (not I2!)
+    af2_raw = scale_signed(epoch_data['SVclockDriftRate'], 2**-59, 8)  # I1
+
+    # BGD E1/E5b group delay
+    bgd_e1e5b_raw = scale_signed(epoch_data['BGDe5b'], 2**-32, 16)  # I2
+
+    # Orbital: non-angular (same scaling as GPS)
+    crs_raw = scale_signed(epoch_data['Crs'], 2**-5, 16)
+    crc_raw = scale_signed(epoch_data['Crc'], 2**-5, 16)
+    cuc_raw = scale_signed(epoch_data['Cuc'], 2**-29, 16)
+    cus_raw = scale_signed(epoch_data['Cus'], 2**-29, 16)
+    cic_raw = scale_signed(epoch_data['Cic'], 2**-29, 16)
+    cis_raw = scale_signed(epoch_data['Cis'], 2**-29, 16)
+    e_raw = scale_unsigned(epoch_data['Eccentricity'], 2**-33, 32)
+    sqrtA_raw = scale_unsigned(epoch_data['sqrtA'], 2**-19, 32)
+
+    # Orbital: angular (same scaling as GPS)
+    deltaN_raw = scale_angular_signed(epoch_data['DeltaN'], 2**-43, 16)
+    m0_raw = scale_angular_signed(epoch_data['M0'], 2**-31, 32)
+    omega0_raw = scale_angular_signed(epoch_data['Omega0'], 2**-31, 32)
+    i0_raw = scale_angular_signed(epoch_data['Io'], 2**-31, 32)
+    omega_raw = scale_angular_signed(epoch_data['omega'], 2**-31, 32)
+    omegaDot_raw = scale_angular_signed(epoch_data['OmegaDot'], 2**-43, 32)
+    idot_raw = scale_angular_signed(epoch_data['IDOT'], 2**-43, 16)
+
+    return {
+        'sv_id': sv_id,
+        'iodNav': iod_nav,
+        'deltaN': deltaN_raw,
+        'm0': m0_raw,
+        'e': e_raw,
+        'sqrtA': sqrtA_raw,
+        'omega0': omega0_raw,
+        'i0': i0_raw,
+        'omega': omega_raw,
+        'omegaDot': omegaDot_raw,
+        'idot': idot_raw,
+        'cuc': cuc_raw,
+        'cus': cus_raw,
+        'crc': crc_raw,
+        'crs': crs_raw,
+        'cic': cic_raw,
+        'cis': cis_raw,
+        'toe': toe_raw,
+        'af0': af0_raw,
+        'af1': af1_raw,
+        'af2': af2_raw,
+        'sisaIndex': sisa_index,
+        'toc': toc_raw,
+        'bgdE1E5b': bgd_e1e5b_raw,
+        'healthE1B': health_e1b,
+        'dataValidityE1B': data_validity_e1b,
+        'healthE5b': health_e5b,
+        'dataValidityE5b': data_validity_e5b,
+    }
+
+
+def build_mga_gal_eph_payload(raw):
+    """Build 76-byte MGA-GAL-EPH payload from raw integer dict.
+
+    Field order verified against pyubx2 MGA-GAL-EPH definition.
+    """
+    payload = struct.pack('<BBBBHhiIIiiiihhhhhhhHiibBHhHBBBBI',
+        0x01,                       # type (U1)
+        0x00,                       # version (U1)
+        raw['sv_id'],               # svId (U1)
+        0x00,                       # reserved0 (U1)
+        raw['iodNav'] & 0xFFFF,     # iodNav (U2)
+        raw['deltaN'],              # deltaN (I2)
+        raw['m0'],                  # m0 (I4)
+        raw['e'] & 0xFFFFFFFF,      # e (U4)
+        raw['sqrtA'] & 0xFFFFFFFF,  # sqrtA (U4)
+        raw['omega0'],              # omega0 (I4)
+        raw['i0'],                  # i0 (I4)
+        raw['omega'],               # omega (I4)
+        raw['omegaDot'],            # omegaDot (I4)
+        raw['idot'],                # iDot (I2)
+        raw['cuc'],                 # cuc (I2)
+        raw['cus'],                 # cus (I2)
+        raw['crc'],                 # crc (I2)
+        raw['crs'],                 # crs (I2)
+        raw['cic'],                 # cic (I2)
+        raw['cis'],                 # cis (I2)
+        raw['toe'],                 # toe (U2)
+        raw['af0'],                 # af0 (I4)
+        raw['af1'],                 # af1 (I4)
+        raw['af2'],                 # af2 (I1)
+        raw['sisaIndex'] & 0xFF,    # sisaIndexE1E5b (U1)
+        raw['toc'],                 # toc (U2)
+        raw['bgdE1E5b'],            # bgdE1E5b (I2)
+        0x0000,                     # reserved1 (U2)
+        raw['healthE1B'] & 0xFF,    # healthE1B (U1)
+        raw['dataValidityE1B'] & 0xFF,  # dataValidityE1B (U1)
+        raw['healthE5b'] & 0xFF,    # healthE5b (U1)
+        raw['dataValidityE5b'] & 0xFF,  # dataValidityE5b (U1)
+        0,                          # reserved2 (U4)
+    )
+
+    assert len(payload) == 76, f"Payload must be 76 bytes, got {len(payload)}"
+    return payload
+
+
+def convert_gal_epoch(sv_id, epoch_data, toc_seconds):
+    """Full conversion: RINEX Galileo epoch -> complete UBX message bytes.
+
+    Args:
+        sv_id: Galileo PRN number (1-36)
+        epoch_data: RINEX Galileo field values
+        toc_seconds: Toc in seconds of GPS week
+    Returns:
+        bytes: complete UBX message (class=0x13, id=0x02)
+    """
+    raw = rinex_epoch_to_mga_gal_eph(sv_id, epoch_data, toc_seconds)
+    payload = build_mga_gal_eph_payload(raw)
+    return create_ubx_message(0x13, 0x02, payload)
 
 
 # ---- Build MGA-*-HEALTH messages ----
@@ -1179,6 +1483,74 @@ def build_mga_glo_timeoffset(glut=None, glgp=None, epoch_time=None):
     return create_ubx_message(0x13, 0x06, payload)
 
 
+# ---- Build MGA-GAL-TIMEOFFSET / MGA-GAL-UTC ----
+
+def build_mga_gal_timeoffset(gagp):
+    """Build MGA-GAL-TIMEOFFSET message (class=0x13, id=0x02, 10-byte payload).
+
+    Args:
+        gagp: dict with 'a0' (Galileo-GPS offset in seconds),
+              'a1' (drift), 'tot' (ref time in seconds), 'wnt' (ref week)
+    Returns:
+        bytes: complete UBX message
+    """
+    # a0G: I2, scaled 2^-35 seconds
+    a0g_raw = scale_signed(gagp['a0'], 2**-35, 16)
+    # a1G: I2, scaled 2^-51 seconds/s
+    a1g_raw = scale_signed(gagp['a1'], 2**-51, 16)
+    # t0G: U1, in units of 3600 seconds
+    t0g_raw = round(gagp['tot'] / 3600) & 0xFF
+    # wn0G: U1, 8-bit week number
+    wn0g_raw = gagp['wnt'] & 0xFF
+
+    payload = struct.pack('<BBHhhBB',
+        0x03,           # type
+        0x00,           # version
+        0x0000,         # reserved0 (U2)
+        a0g_raw,        # a0G (I2)
+        a1g_raw,        # a1G (I2)
+        t0g_raw,        # t0G (U1)
+        wn0g_raw,       # wn0G (U1)
+    )
+    assert len(payload) == 10, f"Expected 10, got {len(payload)}"
+    return create_ubx_message(0x13, 0x02, payload)
+
+
+def build_mga_gal_utc(gaut, leap_seconds):
+    """Build MGA-GAL-UTC message (class=0x13, id=0x02, 20-byte payload).
+
+    Args:
+        gaut: dict with 'a0', 'a1', 'tot' (seconds), 'wnt' (full GPS week)
+        leap_seconds: current UTC-GPS leap seconds (int)
+    Returns:
+        bytes: complete UBX message
+    """
+    # Same structure as MGA-GPS-UTC but type=0x05 and id=0x02 (GAL)
+    a0_raw = round(gaut['a0'] / 2**-30)
+    a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
+    a1_raw = round(gaut['a1'] / 2**-50)
+    a1_raw = max(-2**31, min(2**31 - 1, a1_raw))
+    tot_raw = round(gaut['tot'] / 4096) & 0xFF
+    wnt_raw = gaut['wnt'] & 0xFF
+
+    payload = struct.pack('<BB2siibBBBBb2s',
+        0x05,               # type
+        0x00,               # version
+        b'\x00\x00',        # reserved1
+        a0_raw,             # utcA0 (I4)
+        a1_raw,             # utcA1 (I4)
+        leap_seconds,       # utcDtLS (I1)
+        tot_raw,            # utcTot (U1)
+        wnt_raw,            # utcWNt (U1)
+        0,                  # utcWNlsf (U1)
+        0,                  # utcDN (U1)
+        leap_seconds,       # utcDtLSF (I1)
+        b'\x00\x00',        # reserved2
+    )
+    assert len(payload) == 20, f"Expected 20, got {len(payload)}"
+    return create_ubx_message(0x13, 0x02, payload)
+
+
 # ---- Epoch selection ----
 
 def select_best_epoch(sv_data, target_time=None, max_age_hours=4.0, sentinel=None):
@@ -1235,13 +1607,14 @@ def convert_rinex(nav, target_time=None, max_age_hours=4.0, systems=None):
         nav: xarray Dataset from georinex
         target_time: target time for epoch selection (datetime64)
         max_age_hours: maximum ephemeris age
-        systems: set of systems to include, e.g. {'GPS', 'QZSS', 'GLO'} (default: all)
+        systems: set of systems to include, e.g. {'GPS', 'QZSS', 'GLO', 'GAL'}
+                 (default: all)
 
     Returns:
         list of (sv_label, ubx_bytes, epoch_time, epoch_vals) tuples
     """
     if systems is None:
-        systems = {'GPS', 'QZSS', 'GLO'}
+        systems = {'GPS', 'QZSS', 'GLO', 'GAL'}
 
     svs = [str(s) for s in nav.coords['sv'].values]
     messages = []
@@ -1262,6 +1635,9 @@ def convert_rinex(nav, target_time=None, max_age_hours=4.0, systems=None):
         elif prefix == 'R' and 'GLO' in systems:
             gnss = 'GLO'
             sv_id = sv_num  # 1-24
+        elif prefix == 'E' and 'GAL' in systems:
+            gnss = 'GAL'
+            sv_id = sv_num  # 1-36
         else:
             continue
 
@@ -1292,6 +1668,9 @@ def convert_rinex(nav, target_time=None, max_age_hours=4.0, systems=None):
         try:
             if gnss == 'GLO':
                 ubx_msg = build_mga_glo_eph(sv_id, epoch_vals, epoch_time)
+            elif gnss == 'GAL':
+                _, toc_seconds = datetime64_to_gps_week_toc(epoch_time)
+                ubx_msg = convert_gal_epoch(sv_id, epoch_vals, toc_seconds)
             else:
                 # GPS / QZSS -- Keplerian ephemeris
                 _, toc_seconds = datetime64_to_gps_week_toc(epoch_time)
@@ -1328,8 +1707,8 @@ Examples:
              'Default: latest available epoch.')
     parser.add_argument('--max-age', type=float, default=4.0, metavar='HOURS',
         help='Maximum ephemeris age in hours (default: 4.0, GLONASS capped at 1.0)')
-    parser.add_argument('--systems', default='GPS,QZSS,GLO',
-        help='Comma-separated GNSS systems to include (default: GPS,QZSS,GLO)')
+    parser.add_argument('--systems', default='GPS,QZSS,GLO,GAL',
+        help='Comma-separated GNSS systems to include (default: GPS,QZSS,GLO,GAL)')
     parser.add_argument('--all-epochs', action='store_true',
         help='Output all epochs, not just the best per satellite')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -1386,6 +1765,7 @@ Examples:
                 prefix = sv_label[0]
                 sv_num = int(sv_label[1:])
                 is_glo = False
+                is_gal = False
                 if prefix == 'G' and 'GPS' in systems:
                     msg_id = 0x00
                     sv_id = sv_num
@@ -1394,6 +1774,9 @@ Examples:
                     sv_id = sv_num
                 elif prefix == 'R' and 'GLO' in systems:
                     is_glo = True
+                    sv_id = sv_num
+                elif prefix == 'E' and 'GAL' in systems:
+                    is_gal = True
                     sv_id = sv_num
                 else:
                     continue
@@ -1415,6 +1798,11 @@ Examples:
                         if is_glo:
                             ubx_msg = build_mga_glo_eph(sv_id, epoch_vals,
                                                         epoch_time)
+                        elif is_gal:
+                            _, toc_seconds = datetime64_to_gps_week_toc(
+                                epoch_time)
+                            ubx_msg = convert_gal_epoch(sv_id, epoch_vals,
+                                                        toc_seconds)
                         else:
                             _, toc_seconds = datetime64_to_gps_week_toc(
                                 epoch_time)
@@ -1508,6 +1896,27 @@ Examples:
                     parts.append(f"tauGps={glgp['a0']:.4e}")
                 print(f"  GLO timeoffset: {' '.join(parts)}", file=sys.stderr)
 
+    # Build Galileo supplementary messages
+    if 'GAL' in systems and any(m[0][0] == 'E' for m in all_messages):
+        # GAL-TIMEOFFSET from GAGP (Galileo-GPS time offset)
+        gagp = all_headers.get('GAGP')
+        if gagp:
+            extra_messages.append(('GAL-TIMEOFFSET',
+                build_mga_gal_timeoffset(gagp)))
+            if args.verbose:
+                print(f"  GAL timeoffset: a0G={gagp['a0']:.4e} "
+                      f"a1G={gagp['a1']:.4e}", file=sys.stderr)
+
+        # GAL-UTC from GAUT (Galileo-UTC time correction)
+        gaut = all_headers.get('GAUT')
+        if gaut and 'LEAP' in all_headers:
+            extra_messages.append(('GAL-UTC',
+                build_mga_gal_utc(gaut, all_headers['LEAP'])))
+            if args.verbose:
+                print(f"  GAL UTC: a0={gaut['a0']:.4e} tot={gaut['tot']} "
+                      f"wnt={gaut['wnt']} leap={all_headers['LEAP']}",
+                      file=sys.stderr)
+
     # Write output: EPH messages first, then supplementary (HEALTH, IONO, UTC)
     with open(args.output, 'wb') as f:
         for sv_label, ubx_msg, epoch_time, epoch_vals in all_messages:
@@ -1527,9 +1936,10 @@ Examples:
         print(f"  Including: {', '.join(names)}", file=sys.stderr)
 
     if args.verbose:
-        # Separate GPS/QZSS and GLONASS for different column formats
+        # Separate systems for different column formats
         gps_msgs = [(s, m, t, v) for s, m, t, v in all_messages if s[0] in 'GJ']
         glo_msgs = [(s, m, t, v) for s, m, t, v in all_messages if s[0] == 'R']
+        gal_msgs = [(s, m, t, v) for s, m, t, v in all_messages if s[0] == 'E']
 
         if gps_msgs:
             print(f"\n{'SV':>4s} {'Epoch':>24s} {'IODC':>5s} {'Toe':>7s} "
@@ -1538,6 +1948,18 @@ Examples:
             for sv_label, ubx_msg, epoch_time, epoch_vals in gps_msgs:
                 print(f"{sv_label:>4s} {str(epoch_time):>24s} "
                       f"{int(epoch_vals.get('IODC', 0)):5d} "
+                      f"{epoch_vals.get('Toe', 0):7.0f} "
+                      f"{epoch_vals.get('sqrtA', 0):11.4f} "
+                      f"{epoch_vals.get('Eccentricity', 0):12.10f}",
+                      file=sys.stderr)
+
+        if gal_msgs:
+            print(f"\n{'SV':>4s} {'Epoch':>24s} {'IODnav':>6s} {'Toe':>7s} "
+                  f"{'sqrtA':>11s} {'e':>12s}", file=sys.stderr)
+            print("-" * 71, file=sys.stderr)
+            for sv_label, ubx_msg, epoch_time, epoch_vals in gal_msgs:
+                print(f"{sv_label:>4s} {str(epoch_time):>24s} "
+                      f"{int(epoch_vals.get('IODnav', 0)):6d} "
                       f"{epoch_vals.get('Toe', 0):7.0f} "
                       f"{epoch_vals.get('sqrtA', 0):11.4f} "
                       f"{epoch_vals.get('Eccentricity', 0):12.10f}",
