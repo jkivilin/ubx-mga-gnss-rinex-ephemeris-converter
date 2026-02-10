@@ -1,0 +1,24 @@
+[MESSAGES CONTROL]
+disable=
+    C0103, # invalid-name (GNSS naming: sqrtA, deltaN, omegaDot, resetMode)
+    C0301, # line-too-long (struct.pack lines)
+    C0302, # too-many-lines
+    C0115, # missing-class-docstring (tests)
+    C0116, # missing-function-docstring (tests)
+    C0411, # wrong-import-order (intentional sectioning in source files)
+    C0413, # wrong-import-position
+    C0415, # import-outside-toplevel (threading in tests)
+    R0801, # duplicate-code (shared message builder between tools)
+    R0904, # too-many-public-methods (test classes)
+    R0912, # too-many-branches (message packing)
+    R0914, # too-many-locals (message packing)
+    R0915, # too-many-statements
+    R1702, # too-many-nested-blocks
+    R1732, # consider-using-with (tempfile in tests)
+    W0201, # attribute-defined-outside-init (pytest setup pattern)
+    W0212, # protected-access (tests accessing _parse methods)
+    W0613, # unused-argument (ser_unused in offline commands)
+    W0718, # broad-exception-caught (georinex fallback)
+    W1514, # unspecified-encoding (RINEX files)
+    E1101, # no-member (pyubx2 dynamic attributes)
+    E0606, # possibly-used-before-assignment (false positive on msg_id)

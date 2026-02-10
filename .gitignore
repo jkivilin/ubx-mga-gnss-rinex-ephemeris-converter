@@ -1,0 +1,30 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# RINEX data files
+*.rnx
+*.rnx.gz
+*.[0-9][0-9]n
+*.[0-9][0-9]g
+*.[0-9][0-9]q
+*.[0-9][0-9]p
+*.obs
+*.nav
+!testdata/**
+
+# UBX binary output
+*.ubx
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

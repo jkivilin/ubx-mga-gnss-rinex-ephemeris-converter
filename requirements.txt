@@ -1,0 +1,7 @@
+# convert_eph.py
+georinex>=1.16
+numpy
+
+# ubx_tool.py
+pyubx2>=1.2.38
+pyserial>=3.5
