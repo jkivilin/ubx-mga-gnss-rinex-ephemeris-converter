@@ -17,6 +17,7 @@ Tests cover:
   - End-to-end integration with real RINEX data files
 """
 
+import gzip
 import math
 import struct
 import sys
@@ -1318,6 +1319,58 @@ class TestParseRinexHeader:
 
 
 # ============================================================
+# _open_rinex context manager
+# ============================================================
+
+class TestOpenRinex:
+    def test_plain_file_passthrough(self, tmp_path):
+        """A plain .rnx path should pass through unchanged."""
+        plain = tmp_path / "test.rnx"
+        plain.write_text("dummy")
+        with convert_eph._open_rinex(str(plain)) as path:
+            assert path == str(plain)
+
+    def test_gz_file_decompressed(self, tmp_path):
+        """A .rnx.gz file should be decompressed to a temp file."""
+        content = b"plain rinex content\n"
+        gz_path = tmp_path / "test.rnx.gz"
+        with gzip.open(str(gz_path), 'wb') as f:
+            f.write(content)
+        with convert_eph._open_rinex(str(gz_path)) as path:
+            assert path != str(gz_path)
+            assert path.endswith('.rnx')
+            with open(path, 'rb') as f:
+                assert f.read() == content
+
+    def test_gz_temp_file_cleaned_up(self, tmp_path):
+        """The temp file should be removed after the context exits."""
+        content = b"cleanup test\n"
+        gz_path = tmp_path / "test.rnx.gz"
+        with gzip.open(str(gz_path), 'wb') as f:
+            f.write(content)
+        with convert_eph._open_rinex(str(gz_path)) as path:
+            tmp_file = path
+            assert os.path.exists(tmp_file)
+        assert not os.path.exists(tmp_file)
+
+    def test_gz_temp_file_cleaned_up_on_error(self, tmp_path):
+        """The temp file should be removed even if an exception occurs."""
+        content = b"error test\n"
+        gz_path = tmp_path / "test.rnx.gz"
+        with gzip.open(str(gz_path), 'wb') as f:
+            f.write(content)
+        tmp_file = None
+        try:
+            with convert_eph._open_rinex(str(gz_path)) as path:
+                tmp_file = path
+                raise RuntimeError("test error")
+        except RuntimeError:
+            pass
+        assert tmp_file is not None
+        assert not os.path.exists(tmp_file)
+
+
+# ============================================================
 # Integration test with real RINEX data
 # ============================================================
 
@@ -1349,15 +1402,9 @@ class TestIntegrationWithRealData:
             if qzss.exists():
                 self.qzss_file = str(qzss)
 
-        # Extract IGS gzip if available
+        # IGS gzip file used directly via _open_rinex
         if os.path.exists(self.IGS_MIXED):
-            import gzip
-            import shutil
-            out = tmp_path / "BRDC00WRD_R_20260410000_01D_MN.rnx"
-            with gzip.open(self.IGS_MIXED, 'rb') as f_in, open(out, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-            if out.exists():
-                self.igs_file = str(out)
+            self.igs_file = self.IGS_MIXED
 
     @pytest.mark.skipif(
         not os.path.exists(os.path.join(_TESTDATA, "brdc0400.26.zip")),
@@ -1400,8 +1447,9 @@ class TestIntegrationWithRealData:
         not os.path.exists(os.path.join(_TESTDATA, "BRDC00WRD_R_20260410000_01D_MN.rnx.gz")),
         reason="IGS RINEX test file not available")
     def test_igs_mixed_rinex3_loading(self):
-        """Test loading mixed RINEX 3 from IGS/BKG."""
-        ds = convert_eph.load_rinex_nav(self.igs_file)
+        """Test loading mixed RINEX 3 from IGS/BKG via _open_rinex."""
+        with convert_eph._open_rinex(self.igs_file) as rinex_path:
+            ds = convert_eph.load_rinex_nav(rinex_path)
         assert ds is not None
         svs = list(ds.coords['sv'].values)
         g_count = sum(1 for s in svs if str(s).startswith('G'))
@@ -1414,7 +1462,8 @@ class TestIntegrationWithRealData:
         reason="IGS RINEX test file not available")
     def test_igs_mixed_full_conversion(self):
         """Test full GPS+QZSS+GLONASS conversion from mixed RINEX 3."""
-        ds = convert_eph.load_rinex_nav(self.igs_file)
+        with convert_eph._open_rinex(self.igs_file) as rinex_path:
+            ds = convert_eph.load_rinex_nav(rinex_path)
         results = convert_eph.convert_rinex(ds)
         # Should have GPS + QZSS + GLONASS ephemeris messages
         assert len(results) >= 50
