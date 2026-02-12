@@ -1089,6 +1089,106 @@ class TestTcpStream:
         srv.close()
         t.join(timeout=2)
 
+    def test_readline_basic(self):
+        """readline should read up to and including the newline."""
+        import threading
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+
+        def send_line():
+            conn, _ = srv.accept()
+            conn.sendall(b'$GPGGA,test*00\r\n')
+            time.sleep(0.5)
+            conn.close()
+
+        t = threading.Thread(target=send_line, daemon=True)
+        t.start()
+
+        stream = ubx_tool.TcpStream('127.0.0.1', port, timeout=2)
+        line = stream.readline()
+        assert line == b'$GPGGA,test*00\r\n'
+        stream.close()
+        srv.close()
+        t.join(timeout=1)
+
+    def test_readline_multiple_lines(self):
+        """readline should return only the first line when multiple are available."""
+        import threading
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+
+        def send_lines():
+            conn, _ = srv.accept()
+            conn.sendall(b'line1\nline2\n')
+            time.sleep(0.5)
+            conn.close()
+
+        t = threading.Thread(target=send_lines, daemon=True)
+        t.start()
+
+        stream = ubx_tool.TcpStream('127.0.0.1', port, timeout=2)
+        time.sleep(0.05)
+        first = stream.readline()
+        assert first == b'line1\n'
+        second = stream.readline()
+        assert second == b'line2\n'
+        stream.close()
+        srv.close()
+        t.join(timeout=1)
+
+    def test_readline_no_newline_returns_on_close(self):
+        """readline should return available data when connection closes without newline."""
+        import threading
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+
+        def send_partial():
+            conn, _ = srv.accept()
+            conn.sendall(b'no newline')
+            conn.close()
+
+        t = threading.Thread(target=send_partial, daemon=True)
+        t.start()
+
+        stream = ubx_tool.TcpStream('127.0.0.1', port, timeout=2)
+        line = stream.readline()
+        assert line == b'no newline'
+        stream.close()
+        srv.close()
+        t.join(timeout=1)
+
+    def test_readline_empty_on_immediate_close(self):
+        """readline should return empty bytes when connection closes immediately."""
+        import threading
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+
+        def close_immediately():
+            conn, _ = srv.accept()
+            conn.close()
+
+        t = threading.Thread(target=close_immediately, daemon=True)
+        t.start()
+
+        stream = ubx_tool.TcpStream('127.0.0.1', port, timeout=2)
+        line = stream.readline()
+        assert line == b''
+        stream.close()
+        srv.close()
+        t.join(timeout=1)
+
     def test_repr(self):
         import threading
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

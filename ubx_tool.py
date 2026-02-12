@@ -164,6 +164,18 @@ class TcpStream:
             "server manages the physical UART"
         )
 
+    def readline(self):
+        """Read until newline, matching pyserial's readline interface."""
+        result = bytearray()
+        while True:
+            byte = self.read(1)
+            if not byte:
+                break
+            result.extend(byte)
+            if byte == b'\n':
+                break
+        return bytes(result)
+
     def close(self):
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
