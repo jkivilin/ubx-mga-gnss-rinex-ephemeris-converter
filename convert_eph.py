@@ -15,13 +15,34 @@ Usage:
 """
 
 import argparse
+import contextlib
+import gzip
+import os
+import shutil
 import sys
 import struct
 import math
+import tempfile
 import warnings
 import numpy as np
 import xarray as xr
 import georinex as gr
+
+
+@contextlib.contextmanager
+def _open_rinex(filepath):
+    """Yield a path to a plain RINEX file, decompressing .gz if needed."""
+    if filepath.endswith('.gz'):
+        with tempfile.NamedTemporaryFile(suffix='.rnx', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with gzip.open(filepath, 'rb') as f_in, open(tmp_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            yield tmp_path
+        finally:
+            os.unlink(tmp_path)
+    else:
+        yield filepath
 
 # ---- RINEX 2 manual parser (fallback for georinex limitations) ----
 
@@ -1354,81 +1375,82 @@ Examples:
     all_headers = {}  # Merged RINEX header params from all input files
 
     for input_file in args.input:
-        print(f"Loading {input_file}...", file=sys.stderr)
+        with _open_rinex(input_file) as rinex_path:
+            print(f"Loading {input_file}...", file=sys.stderr)
 
-        # Parse header for iono/UTC parameters
-        try:
-            hdr = parse_rinex_header(input_file)
-            all_headers.update(hdr)
-        except Exception as e:
-            print(f"  Warning: failed to parse header: {e}", file=sys.stderr)
+            # Parse header for iono/UTC parameters
+            try:
+                hdr = parse_rinex_header(rinex_path)
+                all_headers.update(hdr)
+            except Exception as e:
+                print(f"  Warning: failed to parse header: {e}", file=sys.stderr)
 
-        try:
-            nav = load_rinex_nav(input_file)
-        except Exception as e:
-            print(f"  Error: {e}", file=sys.stderr)
-            continue
+            try:
+                nav = load_rinex_nav(rinex_path)
+            except Exception as e:
+                print(f"  Error: {e}", file=sys.stderr)
+                continue
 
-        svs = [str(s) for s in nav.coords['sv'].values]
-        times = nav.coords['time'].values
-        print(f"  Satellites: {len(svs)}, epochs: {len(times)}", file=sys.stderr)
-        if len(times) > 0:
-            print(f"  Time range: {times[0]} to {times[-1]}", file=sys.stderr)
-        if target_time is not None:
-            print(f"  Target time: {target_time}", file=sys.stderr)
+            svs = [str(s) for s in nav.coords['sv'].values]
+            times = nav.coords['time'].values
+            print(f"  Satellites: {len(svs)}, epochs: {len(times)}", file=sys.stderr)
+            if len(times) > 0:
+                print(f"  Time range: {times[0]} to {times[-1]}", file=sys.stderr)
+            if target_time is not None:
+                print(f"  Target time: {target_time}", file=sys.stderr)
 
-        if len(svs) == 0 or len(times) == 0:
-            print("  No satellite data found, skipping.", file=sys.stderr)
-            continue
+            if len(svs) == 0 or len(times) == 0:
+                print("  No satellite data found, skipping.", file=sys.stderr)
+                continue
 
-        if args.all_epochs:
-            for sv_label in sorted(svs):
-                prefix = sv_label[0]
-                sv_num = int(sv_label[1:])
-                is_glo = False
-                if prefix == 'G' and 'GPS' in systems:
-                    msg_id = 0x00
-                    sv_id = sv_num
-                elif prefix == 'J' and 'QZSS' in systems:
-                    msg_id = 0x05
-                    sv_id = sv_num
-                elif prefix == 'R' and 'GLO' in systems:
-                    is_glo = True
-                    sv_id = sv_num
-                else:
-                    continue
+            if args.all_epochs:
+                for sv_label in sorted(svs):
+                    prefix = sv_label[0]
+                    sv_num = int(sv_label[1:])
+                    is_glo = False
+                    if prefix == 'G' and 'GPS' in systems:
+                        msg_id = 0x00
+                        sv_id = sv_num
+                    elif prefix == 'J' and 'QZSS' in systems:
+                        msg_id = 0x05
+                        sv_id = sv_num
+                    elif prefix == 'R' and 'GLO' in systems:
+                        is_glo = True
+                        sv_id = sv_num
+                    else:
+                        continue
 
-                sv_data = nav.sel(sv=sv_label)
-                sentinel = 'X' if is_glo else 'sqrtA'
-                if sentinel not in sv_data.data_vars:
-                    continue
-                valid_mask = ~np.isnan(sv_data[sentinel].values)
-                valid_indices = np.where(valid_mask)[0]
+                    sv_data = nav.sel(sv=sv_label)
+                    sentinel = 'X' if is_glo else 'sqrtA'
+                    if sentinel not in sv_data.data_vars:
+                        continue
+                    valid_mask = ~np.isnan(sv_data[sentinel].values)
+                    valid_indices = np.where(valid_mask)[0]
 
-                for idx in valid_indices:
-                    epoch_time = times[idx]
-                    epoch_vals = {}
-                    for var in nav.data_vars:
-                        val = float(sv_data[var].values[idx])
-                        epoch_vals[var] = 0.0 if np.isnan(val) else val
-                    try:
-                        if is_glo:
-                            ubx_msg = build_mga_glo_eph(sv_id, epoch_vals,
-                                                        epoch_time)
-                        else:
-                            _, toc_seconds = datetime64_to_gps_week_toc(
-                                epoch_time)
-                            ubx_msg = convert_epoch(sv_id, epoch_vals,
-                                                    toc_seconds, msg_id)
-                        all_messages.append((sv_label, ubx_msg, epoch_time,
-                                            epoch_vals))
-                    except (ValueError, struct.error) as e:
-                        if args.verbose:
-                            print(f"  Warning: {sv_label} @ {epoch_time}: {e}",
-                                  file=sys.stderr)
-        else:
-            msgs = convert_rinex(nav, target_time, args.max_age, systems)
-            all_messages.extend(msgs)
+                    for idx in valid_indices:
+                        epoch_time = times[idx]
+                        epoch_vals = {}
+                        for var in nav.data_vars:
+                            val = float(sv_data[var].values[idx])
+                            epoch_vals[var] = 0.0 if np.isnan(val) else val
+                        try:
+                            if is_glo:
+                                ubx_msg = build_mga_glo_eph(sv_id, epoch_vals,
+                                                            epoch_time)
+                            else:
+                                _, toc_seconds = datetime64_to_gps_week_toc(
+                                    epoch_time)
+                                ubx_msg = convert_epoch(sv_id, epoch_vals,
+                                                        toc_seconds, msg_id)
+                            all_messages.append((sv_label, ubx_msg, epoch_time,
+                                                epoch_vals))
+                        except (ValueError, struct.error) as e:
+                            if args.verbose:
+                                print(f"  Warning: {sv_label} @ {epoch_time}: {e}",
+                                      file=sys.stderr)
+            else:
+                msgs = convert_rinex(nav, target_time, args.max_age, systems)
+                all_messages.extend(msgs)
 
     if not all_messages:
         print("No ephemeris data converted.", file=sys.stderr)
