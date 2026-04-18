@@ -1,10 +1,10 @@
 # ubx-mga-gnss-rinex-ephemeris-converter
 
-Converts RINEX navigation files to u-blox 8 / M8 UBX-MGA ephemeris messages (GPS, QZSS, GLONASS) and provides a serial tool for sending assistance data to u-blox receivers.
+Converts RINEX navigation files to u-blox 8 / M8 UBX-MGA ephemeris messages (GPS, QZSS, GLONASS, Galileo) and provides a serial tool for sending assistance data to u-blox receivers.
 
 Provides two tools:
 
-- **convert_eph.py** — Converts RINEX 2/3 navigation files to UBX binary files containing MGA-GPS-EPH, MGA-QZSS-EPH, MGA-GLO-EPH, and supplementary messages (health, ionosphere, UTC, time offset)
+- **convert_eph.py** — Converts RINEX 2/3 navigation files to UBX binary files containing MGA-GPS-EPH, MGA-QZSS-EPH, MGA-GLO-EPH, MGA-GAL-EPH, and supplementary messages (health, ionosphere, UTC, time offset)
 - **ubx_tool.py** — Serial tool for interacting with u-blox receivers: send MGA messages, reset, measure TTFF, poll status, dump navigation database
 
 ## Background
@@ -59,6 +59,9 @@ The tool includes its own RINEX 2 and RINEX 3 parser as a fallback, since georin
 | MGA-GPS-IONO | 0x13 0x00 | GPS ionosphere model parameters (Klobuchar) |
 | MGA-GPS-UTC | 0x13 0x00 | GPS-UTC time correction |
 | MGA-GLO-TIMEOFFSET | 0x13 0x06 | GLONASS-UTC/GPS time correction |
+| MGA-GAL-EPH | 0x13 0x02 | Galileo broadcast ephemeris (per satellite) |
+| MGA-GAL-TIMEOFFSET | 0x13 0x02 | Galileo-GPS time offset |
+| MGA-GAL-UTC | 0x13 0x02 | Galileo-UTC time correction |
 
 ### Usage
 
@@ -75,7 +78,7 @@ convert_eph.py BRDC00WRD_R_20260390000_01D_MN.rnx -o eph.ubx
 # Select specific target time (picks closest epoch per satellite)
 convert_eph.py brdc0380.26n -o eph.ubx --time 2026-02-07T16:00
 
-# GPS and GLONASS only (skip QZSS)
+# GPS and GLONASS only (skip QZSS and Galileo)
 convert_eph.py brdc0380.26n -o eph.ubx --systems GPS,GLO
 
 # Verbose output with per-satellite details
@@ -84,7 +87,7 @@ convert_eph.py brdc0380.26n brdc0380.26q -o eph.ubx -v
 
 ### Epoch selection
 
-By default, the tool selects the most recent ephemeris epoch per satellite (within 4 hours for GPS/QZSS, 1 hour for GLONASS). Use `--time` to select epochs closest to a specific time, or `--all-epochs` to include all available epochs.
+By default, the tool selects the most recent ephemeris epoch per satellite (within 4 hours for GPS/QZSS/Galileo, 1 hour for GLONASS). Use `--time` to select epochs closest to a specific time, or `--all-epochs` to include all available epochs.
 
 ### RINEX data sources
 
@@ -213,6 +216,7 @@ TTFF: 27.3s (3D fix, 14 SVs, hAcc=7.1m)
 - **georinex limitations**: georinex cannot decode some RINEX files, including certain QZSS RINEX 2 navigation files and RINEX 3 mixed navigation files with GLONASS records. The tool includes built-in RINEX 2 and RINEX 3 parsers that are used automatically as a fallback when georinex fails.
 - **RINEX field naming**: georinex uses slightly different field names than standard RINEX documentation. The parser handles both RINEX 2 and 3 naming conventions.
 - **GLONASS ephemeris validity**: GLONASS ephemeris has a shorter validity period (~30 min) than GPS (~4 hours). The epoch selection defaults to 1 hour max age for GLONASS.
+- **Galileo I/NAV vs F/NAV**: Galileo broadcasts on two navigation message types (I/NAV and F/NAV). When georinex produces duplicate SVs with `_1` suffix, the tool automatically deduplicates them, preferring I/NAV data (DataSrc bit 0 set) for correct BGDe5b values.
 
 ## Testing
 
