@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import gzip
 import os
+import re
 import shutil
 import sys
 import struct
@@ -629,6 +630,81 @@ def _deduplicate_galileo_svs(nav_gal):
     return nav_gal
 
 
+# Per-constellation valid svId ranges (u-blox MGA satellite identifier). Each upper bound is the
+# constellation's message-format MAXIMUM, so no real satellite is ever dropped -- present or
+# future:
+#   GPS  1-32  (C/A PRN space)
+#   QZSS 1-10  (u-blox QZSS svId range)
+#   GLONASS 1-31  (the broadcast slot number is a 5-bit field = 32 codes 0-31; code 0 is the
+#                  reserved "empty/unknown slot" sentinel, so the addressable satellites are slots
+#                  1-31 -- nominal 1-24, GLONASS-K 25-27, headroom to 31. Code 0 or a value >31 is
+#                  not a valid slot, so it can only be corruption -- reject + log, don't inject.)
+#   GAL  1-36  (Galileo SV space)
+# A value outside these cannot be a valid satellite, so it is rejected AND logged (see
+# parse_sv_label) -- a coverage change can never silently hide behind the range guard.
+_SV_RANGES = {'G': (1, 32), 'J': (1, 10), 'R': (1, 31), 'E': (1, 36)}
+_SV_LABEL_RE = re.compile(r'^([GJRE])(\d{2})(?:_\d+)?$')
+_warned_oor_labels = set()  # dedupe out-of-range warnings within a single conversion run
+
+
+def parse_sv_label(sv_label):
+    """Parse a satellite coordinate label into (prefix, sv_num), tolerating georinex's '_N'
+    duplicate-record suffix (e.g. 'R03_1' for a second nav record of R03; see georinex
+    issue #48). Returns None for a malformed label or a sv number outside the constellation's
+    valid range.
+
+    Why this exists: the naive ``int(sv_label[1:])`` SILENTLY mis-parses 'R03_1' because Python
+    treats '_' as a digit-group separator, so ``int('03_1') == 31`` -- yielding a bogus svId
+    (slot*10+1) instead of raising. Stripping the suffix and range-checking prevents that.
+    """
+    m = _SV_LABEL_RE.match(str(sv_label))
+    if m is None:
+        return None
+    prefix, sv_num = m.group(1), int(m.group(2))
+    lo, hi = _SV_RANGES[prefix]
+    if not lo <= sv_num <= hi:
+        # A well-formed G/J/R/E label whose number exceeds what the constellation's message format
+        # can represent -- so it's corruption, not a real satellite. Drop it, but make the drop
+        # VISIBLE (deduped, once per label per run) so a genuine constellation expansion surfaces
+        # as "widen _SV_RANGES" in the log instead of silently losing aiding for that satellite.
+        key = (prefix, sv_num)
+        if key not in _warned_oor_labels:
+            _warned_oor_labels.add(key)
+            print(f"Warning: skipping {prefix}{sv_num:02d} -- svId outside valid range "
+                  f"{lo}-{hi} for this constellation (corruption, or widen _SV_RANGES if "
+                  f"the system has grown)", file=sys.stderr)
+        return None
+    return prefix, sv_num
+
+
+def _deduplicate_suffixed_svs(nav):
+    """Drop georinex '_N' duplicate-record labels (e.g. 'R03_1', 'G05_1') before the build loop
+    can mis-parse them into bogus or duplicate svIds. For each base SV, keep exactly ONE
+    representative: if the base label exists, drop all of its suffixed duplicates; otherwise
+    promote a single suffixed label to the base and drop the rest -- so multiple suffixes for the
+    same SV (e.g. 'R03_1' and 'R03_2' with no plain 'R03') can never collide on rename. Used for
+    GPS/QZSS/GLONASS; Galileo keeps its own I/NAV-aware dedup (_deduplicate_galileo_svs).
+    """
+    svs = [str(s) for s in nav.coords['sv'].values]
+    have_base = {s for s in svs if '_' not in s}
+    drop, rename, promoted = [], {}, set()
+    for sv in svs:
+        if '_' not in sv:
+            continue
+        base = sv.split('_')[0]
+        if base in have_base or base in promoted:
+            drop.append(sv)          # a representative for this base already exists -> drop dup
+        else:
+            rename[sv] = base        # promote exactly one suffixed label to the base
+            promoted.add(base)
+    if drop:
+        nav = nav.sel(sv=[sv for sv in svs if sv not in drop])
+    if rename:
+        cur = [str(s) for s in nav.coords['sv'].values]
+        nav = nav.assign_coords(sv=[rename.get(s, s) for s in cur])
+    return nav
+
+
 def load_rinex_nav(filepath):
     """Load RINEX navigation file, with fallback for formats georinex can't handle.
 
@@ -674,9 +750,9 @@ def load_rinex_nav(filepath):
                 if nav_sys is None:
                     nav_sys = parse_rinex3_nav(filepath, systems=sys_char)
                 if nav_sys is not None:
-                    parts.append(nav_sys)
+                    parts.append(_deduplicate_suffixed_svs(nav_sys))
         else:
-            parts.append(nav_gj)
+            parts.append(_deduplicate_suffixed_svs(nav_gj))
 
         # GLONASS: try georinex first, fall back to manual parser
         nav_glo = None
@@ -691,6 +767,7 @@ def load_rinex_nav(filepath):
         if nav_glo is None:
             nav_glo = parse_rinex3_nav(filepath, systems='R')
         if nav_glo is not None:
+            nav_glo = _deduplicate_suffixed_svs(nav_glo)
             parts.append(nav_glo)
 
         # Galileo: try georinex first, fall back to manual parser
@@ -1641,8 +1718,10 @@ def convert_rinex(nav, target_time=None, max_age_hours=4.0, systems=None):
     messages = []
 
     for sv_label in sorted(svs):
-        prefix = sv_label[0]
-        sv_num = int(sv_label[1:])
+        parsed = parse_sv_label(sv_label)
+        if parsed is None:
+            continue  # malformed, out-of-range, or georinex '_N' duplicate (e.g. 'R03_1')
+        prefix, sv_num = parsed
 
         # Determine GNSS system and conversion path
         if prefix == 'G' and 'GPS' in systems:
@@ -1784,8 +1863,10 @@ Examples:
 
             if args.all_epochs:
                 for sv_label in sorted(svs):
-                    prefix = sv_label[0]
-                    sv_num = int(sv_label[1:])
+                    parsed = parse_sv_label(sv_label)
+                    if parsed is None:
+                        continue  # malformed/out-of-range/'_N' duplicate label
+                    prefix, sv_num = parsed
                     is_glo = False
                     is_gal = False
                     if prefix == 'G' and 'GPS' in systems:
@@ -1848,8 +1929,10 @@ Examples:
     gps_health = {}
     qzss_health = {}
     for sv_label, ubx_msg, epoch_time, epoch_vals in all_messages:
-        prefix = sv_label[0]
-        sv_num = int(sv_label[1:])
+        parsed = parse_sv_label(sv_label)
+        if parsed is None:
+            continue
+        prefix, sv_num = parsed
         health_val = int(epoch_vals.get('health', 0))
         if prefix == 'G':
             gps_health[sv_num] = health_val
