@@ -2256,3 +2256,71 @@ class TestGalileoIntegration:
         assert 0x00 in msg_ids  # GPS
         assert 0x02 in msg_ids  # Galileo
         assert 0x06 in msg_ids  # GLONASS
+
+
+# ============================================================
+# Regression: georinex '_N' duplicate-record labels must not become bogus svIds.
+# (e.g. georinex emits 'R03_1' for a 2nd GLONASS record; int('03_1') silently == 31.)
+# ============================================================
+
+class TestSvLabelParsing:
+    def test_plain_labels(self):
+        assert convert_eph.parse_sv_label("R03") == ("R", 3)
+        assert convert_eph.parse_sv_label("G32") == ("G", 32)
+        assert convert_eph.parse_sv_label("E36") == ("E", 36)
+        assert convert_eph.parse_sv_label("J01") == ("J", 1)
+
+    def test_georinex_suffix_is_stripped_not_misparsed(self):
+        # The core bug: int("03_1") == 31. parse_sv_label must yield slot 3, never 31.
+        assert convert_eph.parse_sv_label("R03_1") == ("R", 3)
+        assert convert_eph.parse_sv_label("R20_1") == ("R", 20)   # would have been 201
+        assert convert_eph.parse_sv_label("R11_2") == ("R", 11)   # would have been 112
+
+    def test_out_of_range_rejected(self):
+        assert convert_eph.parse_sv_label("R32") is None          # >31: beyond GLONASS 5-bit slot field
+        assert convert_eph.parse_sv_label("R00") is None
+        assert convert_eph.parse_sv_label("G33") is None          # >32: beyond GPS PRN space
+
+    def test_glonass_full_slot_range_kept(self):
+        # GLONASS slot number is a 5-bit field (max 31), so every representable slot must survive
+        # the guard -- nominal 1-24, GLONASS-K 25-27, and any future 28-31 -- never silently dropped.
+        for s in (24, 25, 26, 27, 28, 31):
+            assert convert_eph.parse_sv_label(f"R{s:02d}") == ("R", s)
+
+    def test_malformed_rejected(self):
+        assert convert_eph.parse_sv_label("X01") is None
+        assert convert_eph.parse_sv_label("R3") is None
+        assert convert_eph.parse_sv_label("") is None
+
+
+class TestDeduplicateSuffixedSvs:
+    @staticmethod
+    def _mk_nav(sv_labels):
+        n = len(sv_labels)
+        return xr.Dataset(
+            {'sqrtA': (('sv', 'time'), np.ones((n, 1)))},
+            coords={'sv': list(sv_labels),
+                    'time': [np.datetime64('2026-06-30T00:00')]},
+        )
+
+    def test_drops_suffixed_when_base_present(self):
+        nav = self._mk_nav(['R03', 'R03_1', 'R05'])
+        out = convert_eph._deduplicate_suffixed_svs(nav)
+        assert sorted(str(s) for s in out.coords['sv'].values) == ['R03', 'R05']
+
+    def test_promotes_one_when_no_base_no_collision(self):
+        # The collision edge: two suffixes, no plain base. Must yield exactly one 'R03'.
+        nav = self._mk_nav(['R03_1', 'R03_2'])
+        out = convert_eph._deduplicate_suffixed_svs(nav)
+        svs = [str(s) for s in out.coords['sv'].values]
+        assert svs == ['R03']
+
+    def test_works_for_gps(self):
+        nav = self._mk_nav(['G01', 'G01_1', 'G02'])
+        out = convert_eph._deduplicate_suffixed_svs(nav)
+        assert sorted(str(s) for s in out.coords['sv'].values) == ['G01', 'G02']
+
+    def test_noop_when_no_suffixes(self):
+        nav = self._mk_nav(['R01', 'R02'])
+        out = convert_eph._deduplicate_suffixed_svs(nav)
+        assert sorted(str(s) for s in out.coords['sv'].values) == ['R01', 'R02']
