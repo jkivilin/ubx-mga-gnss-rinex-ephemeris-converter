@@ -95,3 +95,32 @@ def test_rinex4_records_ignored_for_rinex3(tmp_path):
     p = tmp_path / "nav3.rnx"
     p.write_text(RINEX4.replace("     4.01", "     3.04", 1))
     assert not convert_eph.parse_rinex4_records(str(p))
+
+
+def test_leap_seconds_future_fields(tmp_path):
+    path = _write(tmp_path, [
+        ("     3.04           N: GNSS NAV DATA    M: MIXED", "RINEX VERSION / TYPE"),
+        ("    18    18  1929     7", "LEAP SECONDS"),
+        ("", "END OF HEADER"),
+    ])
+    h = convert_eph.parse_rinex_header(path)
+    assert h["LEAP"] == 18
+    assert h["LEAP_FUTURE"] == {"dtlsf": 18, "wnlsf": 1929, "dn": 7}
+
+
+def test_leap_seconds_current_only_and_bds(tmp_path):
+    p1 = _write(tmp_path, [("    18", "LEAP SECONDS"), ("", "END OF HEADER")])
+    assert convert_eph.parse_rinex_header(p1) == {"LEAP": 18}
+    p2 = _write(tmp_path, [("     4     4  1929     7BDS", "LEAP SECONDS"), ("", "END OF HEADER")])
+    assert "LEAP_FUTURE" not in convert_eph.parse_rinex_header(p2)
+
+
+def test_gps_and_gal_utc_leap_event_fields():
+    utc = {"a0": 0.0, "a1": 0.0, "tot": 61440, "wnt": 2440}
+    fut = {"dtlsf": 19, "wnlsf": 2450, "dn": 3}
+    for build in (convert_eph.build_mga_gps_utc, convert_eph.build_mga_gal_utc):
+        p = build(utc, 18, fut)[6:-2]
+        assert p[12] == 18
+        assert p[15] == 2450 & 0xFF and p[16] == 3 and p[17] == 19
+        p = build(utc, 18)[6:-2]
+        assert p[15] == 0 and p[16] == 0 and p[17] == 18

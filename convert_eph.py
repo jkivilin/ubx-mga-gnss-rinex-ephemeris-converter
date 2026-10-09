@@ -1272,6 +1272,11 @@ def parse_rinex_header(path):
                                       'tot': int(line[41:50].strip()), 'wnt': int(line[50:59].strip())}
                 elif label == 'LEAP SECONDS':
                     params['LEAP'] = int(line[:6])
+                    fut = [line[6 + k*6 : 12 + k*6].strip() for k in range(3)]
+                    sysid = line[24:27].strip()
+                    if all(fut) and sysid in ('', 'GPS'):
+                        params['LEAP_FUTURE'] = {'dtlsf': int(fut[0]), 'wnlsf': int(fut[1]),
+                                                 'dn': int(fut[2])}
             except ValueError as e:
                 print(f"  Warning: skipping header line {label!r}: {e}", file=sys.stderr)
     return params
@@ -1382,12 +1387,15 @@ def build_mga_gps_iono(gpsa, gpsb):
     return create_ubx_message(0x13, 0x00, payload)
 
 
-def build_mga_gps_utc(gput, leap_seconds):
+def build_mga_gps_utc(gput, leap_seconds, leap_future=None):
     """Build MGA-GPS-UTC message (class=0x13, id=0x00, 20-byte payload).
 
     Args:
         gput: dict with 'a0', 'a1', 'tot' (seconds), 'wnt' (full GPS week)
         leap_seconds: current UTC-GPS leap seconds (int)
+        leap_future: optional dict with 'dtlsf', 'wnlsf' (GPS week), 'dn' from
+            the RINEX 3/4 LEAP SECONDS header line. Without it no leap second
+            change is announced (dtLSF = dtLS, WNlsf = DN = 0).
     Returns:
         bytes: complete UBX message
     """
@@ -1396,7 +1404,7 @@ def build_mga_gps_utc(gput, leap_seconds):
     # utcDtLS: I1, current leap seconds
     # utcTot: U1, scaled 2^12 s (tot / 4096)
     # utcWNt: U1, 8-bit truncated GPS week
-    # utcWNlsf, utcDN, utcDtLSF: future leap second info (not in RINEX)
+    # utcWNlsf, utcDN, utcDtLSF: leap second event (RINEX 3/4 LEAP SECONDS)
     a0_raw = round(gput['a0'] / 2**-30)
     a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
     a1_raw = round(gput['a1'] / 2**-50)
@@ -1404,8 +1412,12 @@ def build_mga_gps_utc(gput, leap_seconds):
     tot_raw = round(gput['tot'] / 4096) & 0xFF
     wnt_raw = gput['wnt'] & 0xFF
 
-    # Future leap second fields: not available in RINEX header.
-    # Set dtLSF = dtLS (no pending change), wnlsf/dn = 0.
+    if leap_future:
+        wnlsf_raw = leap_future['wnlsf'] & 0xFF
+        dn_raw = leap_future['dn'] & 0xFF
+        dtlsf = leap_future['dtlsf']
+    else:
+        wnlsf_raw, dn_raw, dtlsf = 0, 0, leap_seconds
     payload = struct.pack('<BB2siibBBBBb2s',
         0x05,               # type
         0x00,               # version
@@ -1415,9 +1427,9 @@ def build_mga_gps_utc(gput, leap_seconds):
         leap_seconds,       # utcDtLS (I1)
         tot_raw,            # utcTot (U1)
         wnt_raw,            # utcWNt (U1)
-        0,                  # utcWNlsf (U1) -- not in RINEX
-        0,                  # utcDN (U1) -- not in RINEX
-        leap_seconds,       # utcDtLSF (I1) -- same as dtLS (no pending change)
+        wnlsf_raw,          # utcWNlsf (U1)
+        dn_raw,             # utcDN (U1)
+        dtlsf,              # utcDtLSF (I1)
         b'\x00\x00',        # reserved2
     )
     assert len(payload) == 20, f"Expected 20, got {len(payload)}"
@@ -1628,7 +1640,7 @@ def build_mga_gal_timeoffset(gagp):
     return create_ubx_message(0x13, 0x02, payload)
 
 
-def build_mga_gal_utc(gaut, leap_seconds):
+def build_mga_gal_utc(gaut, leap_seconds, leap_future=None):
     """Build MGA-GAL-UTC message (class=0x13, id=0x02, 20-byte payload).
 
     Args:
@@ -1637,7 +1649,14 @@ def build_mga_gal_utc(gaut, leap_seconds):
     Returns:
         bytes: complete UBX message
     """
-    # Same structure as MGA-GPS-UTC but type=0x05 and id=0x02 (GAL)
+    # Same structure as MGA-GPS-UTC but type=0x05 and id=0x02 (GAL).
+    # The 8-bit WNlsf is the same for GPS and GST weeks (they differ by 1024).
+    if leap_future:
+        wnlsf_raw = leap_future['wnlsf'] & 0xFF
+        dn_raw = leap_future['dn'] & 0xFF
+        dtlsf = leap_future['dtlsf']
+    else:
+        wnlsf_raw, dn_raw, dtlsf = 0, 0, leap_seconds
     a0_raw = round(gaut['a0'] / 2**-30)
     a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
     a1_raw = round(gaut['a1'] / 2**-50)
@@ -1654,9 +1673,9 @@ def build_mga_gal_utc(gaut, leap_seconds):
         leap_seconds,       # utcDtLS (I1)
         tot_raw,            # utcTot (U1)
         wnt_raw,            # utcWNt (U1)
-        0,                  # utcWNlsf (U1)
-        0,                  # utcDN (U1)
-        leap_seconds,       # utcDtLSF (I1)
+        wnlsf_raw,          # utcWNlsf (U1)
+        dn_raw,             # utcDN (U1)
+        dtlsf,              # utcDtLSF (I1)
         b'\x00\x00',        # reserved2
     )
     assert len(payload) == 20, f"Expected 20, got {len(payload)}"
@@ -1986,7 +2005,7 @@ Examples:
     # Build UTC message from RINEX header (GPS-UTC time correction)
     if 'GPUT' in all_headers and 'LEAP' in all_headers and 'GPS' in systems:
         extra_messages.append(('GPS-UTC', build_mga_gps_utc(
-            all_headers['GPUT'], all_headers['LEAP'])))
+            all_headers['GPUT'], all_headers['LEAP'], all_headers.get('LEAP_FUTURE'))))
         if args.verbose:
             gput = all_headers['GPUT']
             print(f"  GPS UTC: a0={gput['a0']:.4e} tot={gput['tot']} "
@@ -2026,7 +2045,7 @@ Examples:
         gaut = all_headers.get('GAUT')
         if gaut and 'LEAP' in all_headers:
             extra_messages.append(('GAL-UTC',
-                build_mga_gal_utc(gaut, all_headers['LEAP'])))
+                build_mga_gal_utc(gaut, all_headers['LEAP'], all_headers.get('LEAP_FUTURE'))))
             if args.verbose:
                 print(f"  GAL UTC: a0={gaut['a0']:.4e} tot={gaut['tot']} "
                       f"wnt={gaut['wnt']} leap={all_headers['LEAP']}",
