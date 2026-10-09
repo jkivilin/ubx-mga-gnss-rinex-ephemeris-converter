@@ -1,4 +1,8 @@
 """Tests for RINEX header/record parsing, leap second fields and Galileo I/NAV selection."""
+import math
+
+import pytest
+
 import convert_eph
 
 
@@ -131,3 +135,133 @@ def test_gal_utc_tot_scale():
     assert p[13] == 120
     p = convert_eph.build_mga_gps_utc({"a0": 0.0, "a1": 0.0, "tot": 61440, "wnt": 2440}, 18)[6:-2]
     assert p[13] == 15
+
+
+GAL_FNAV = """E36 2026 10 09 11 10 00-6.332660559565D-04-5.172751116334D-12 0.000000000000D+00
+     2.500000000000D+01-1.524062500000D+02 2.391171030443D-09 3.112872742410D+00
+    -7.016584277153D-06 2.225677017123D-04 1.202337443829D-05 5.440608079910D+03
+     4.722000000000D+05 2.421438694000D-08-5.917720083995D-01-2.607703208923D-08
+     9.971050159405D-01 9.618750000000D+01-1.374700419368D+00-5.286291623836D-09
+    -3.860875106660D-10 2.580000000000D+02 2.439000000000D+03 0.000000000000D+00
+     3.120000000000D+00 0.000000000000D+00 3.492459654808D-09 0.000000000000D+00
+     4.729500000000D+05
+"""
+GAL_INAV = """E36 2026 10 09 11 10 00-6.332648918033D-04-5.186961971049D-12 0.000000000000D+00
+     2.500000000000D+01-1.524062500000D+02 2.391171030443D-09 3.112872742410D+00
+    -7.016584277153D-06 2.225677017123D-04 1.202337443829D-05 5.440608079910D+03
+     4.722000000000D+05 2.421438694000D-08-5.917720083995D-01-2.607703208923D-08
+     9.971050159405D-01 9.618750000000D+01-1.374700419368D+00-5.286291623836D-09
+    -3.860875106660D-10 5.130000000000D+02 2.439000000000D+03 0.000000000000D+00
+     3.120000000000D+00 0.000000000000D+00 3.492459654808D-09 3.958120942116D-09
+     4.728640000000D+05
+"""
+HDR3 = "     3.04           N: GNSS NAV DATA    E: GALILEO          RINEX VERSION / TYPE\n" \
+       "                                                            END OF HEADER\n"
+HDR4 = "     4.01           N: GNSS NAV DATA    E: GALILEO          RINEX VERSION / TYPE\n" \
+       "                                                            END OF HEADER\n"
+INAV_AF0 = -6.332648918033e-04
+
+
+def _gal_af0(path):
+    nav = convert_eph.load_rinex_nav(path)
+    d = nav.sel(sv="E36").dropna(dim="time", how="all")
+    return float(d["SVclockBias"].values[0]), int(d["DataSrc"].values[0])
+
+
+@pytest.mark.parametrize("order", ["fnav_first", "inav_first"])
+def test_galileo_prefers_inav_rinex3(tmp_path, order):
+    body = GAL_FNAV + GAL_INAV if order == "fnav_first" else GAL_INAV + GAL_FNAV
+    p = tmp_path / "gal3.rnx"
+    p.write_text(HDR3 + body)
+    af0, dsrc = _gal_af0(str(p))
+    assert dsrc % 2 == 1 and af0 == INAV_AF0
+
+
+@pytest.mark.parametrize("order", ["fnav_first", "inav_first"])
+def test_galileo_prefers_inav_rinex4(tmp_path, order):
+    f = "> EPH E36 FNAV\n" + GAL_FNAV
+    i = "> EPH E36 INAV\n" + GAL_INAV
+    p = tmp_path / "gal4.rnx"
+    p.write_text(HDR4 + (f + i if order == "fnav_first" else i + f))
+    af0, dsrc = _gal_af0(str(p))
+    assert dsrc % 2 == 1 and af0 == INAV_AF0
+
+
+GAL_1210_INAV_THEN_FNAV = """E36 2026 10 09 12 10 00-6.332836346701D-04-5.201172825764D-12 0.000000000000D+00
+     3.100000000000D+01-1.487187500000D+02 2.395814080987D-09-2.726300187540D+00
+    -6.781890988350D-06 2.229309175164D-04 1.220777630806D-05 5.440606832504D+03
+     4.758000000000D+05 2.607703208923D-08-5.917909765953D-01-1.303851604462D-08
+     9.971036042245D-01 9.287500000000D+01-1.372402375485D+00-5.294149093989D-09
+    -3.903734034763D-10 5.130000000000D+02 2.439000000000D+03 0.000000000000D+00
+     3.120000000000D+00 0.000000000000D+00 3.492459654808D-09 3.958120942116D-09
+     4.767940000000D+05
+E36 2026 10 09 12 10 00-6.332848570310D-04-5.201172825764D-12 0.000000000000D+00
+     3.100000000000D+01-1.487187500000D+02 2.395814080987D-09-2.726300187540D+00
+    -6.781890988350D-06 2.229309175164D-04 1.220777630806D-05 5.440606832504D+03
+     4.758000000000D+05 2.607703208923D-08-5.917909765953D-01-1.303851604462D-08
+     9.971036042245D-01 9.287500000000D+01-1.372402375485D+00-5.294149093989D-09
+    -3.903734034763D-10 2.580000000000D+02 2.439000000000D+03 0.000000000000D+00
+     3.120000000000D+00 0.000000000000D+00 3.492459654808D-09 0.000000000000D+00
+     4.768000000000D+05
+"""
+
+
+def test_galileo_mixed_order_across_epochs_rinex3(tmp_path):
+    """11:10 has F/NAV first, 12:10 has I/NAV first (as in real station files)."""
+    p = tmp_path / "gal3mix.rnx"
+    p.write_text(HDR3 + GAL_FNAV + GAL_INAV + GAL_1210_INAV_THEN_FNAV)
+    nav = convert_eph.load_rinex_nav(str(p))
+    d = nav.sel(sv="E36").dropna(dim="time", how="all")
+    assert [int(x) % 2 for x in d["DataSrc"].values] == [1, 1]
+    assert float(d["SVclockBias"].values[0]) == INAV_AF0
+    assert float(d["SVclockBias"].values[1]) == -6.332836346701e-04
+
+
+GAL_E02_513_THEN_516 = """E02 2026 02 09 19 00 00 1.683452865109e-05 2.856381797756e-12 0.000000000000e+00
+     4.000000000000e+00 6.421875000000e+01 3.215491080967e-09 2.222952385518e+00
+     3.041699528694e-06 5.290118278936e-04 8.843839168549e-06 5.440619571686e+03
+     1.548000000000e+05-1.676380634308e-08 1.521238415926e+00 1.303851604462e-08
+     9.618345189427e-01 1.539062500000e+02 8.163085603338e-01-5.470585014681e-09
+    -1.071473202588e-10 5.130000000000e+02 2.405000000000e+03 0.000000000000e+00
+     3.120000000000e+00 0.000000000000e+00-3.492459654808e-09-4.190951585770e-09
+     1.554640000000e+05                                                         
+E02 2026 02 09 21 10 00 1.685688039288e-05 2.870592652471e-12 0.000000000000e+00
+     1.700000000000e+01 7.206250000000e+01 3.095486082277e-09-3.091703890631e+00
+     3.160908818245e-06 5.274643190205e-04 9.210780262947e-06 5.440622989655e+03
+     1.626000000000e+05-4.842877388000e-08 1.521195874268e+00 0.000000000000e+00
+     9.618337787062e-01 1.418125000000e+02 8.147877019211e-01-5.459155967187e-09
+    -1.296482575132e-10 5.160000000000e+02 2.405000000000e+03 0.000000000000e+00
+     3.120000000000e+00 0.000000000000e+00-3.492459654808e-09-4.190951585770e-09
+     1.632640000000e+05                                                         
+"""
+
+
+def test_galileo_e5b_inav_record_is_kept(tmp_path):
+    """DataSrc 516 (I/NAV E5b-I) is I/NAV like 513 and must not be dropped as F/NAV."""
+    p = tmp_path / "gal516.rnx"
+    p.write_text(HDR3 + GAL_E02_513_THEN_516)
+    nav = convert_eph.load_rinex_nav(str(p))
+    d = nav.sel(sv="E02").dropna(dim="time", how="all")
+    assert [int(x) for x in d["DataSrc"].values] == [513, 516]
+    assert float(d["SVclockBias"].values[1]) == 1.685688039288e-05
+    assert convert_eph._is_inav(516) and convert_eph._is_inav(513) and convert_eph._is_inav(517)
+    assert not convert_eph._is_inav(258) and not convert_eph._is_inav(2)
+
+
+GAL_BLANK_DSRC = GAL_INAV.replace(" 5.130000000000D+02", " " * 19)
+
+
+def test_rinex4_blank_datasrc_record_loads(tmp_path):
+    """A blank DataSrc field (NaN) must not abort loading."""
+    p = tmp_path / "blank4.rnx"
+    p.write_text(HDR4 + "> EPH E36 INAV\n" + GAL_BLANK_DSRC)
+    d = convert_eph.load_rinex_nav(str(p)).sel(sv="E36")
+    assert math.isnan(float(d["DataSrc"].values[0]))
+    assert float(d["SVclockBias"].values[0]) == INAV_AF0
+
+
+def test_rinex4_inav_wins_over_blank_datasrc(tmp_path):
+    p = tmp_path / "blank4dup.rnx"
+    p.write_text(HDR4 + "> EPH E36 INAV\n" + GAL_INAV + "> EPH E36 INAV\n" + GAL_BLANK_DSRC)
+    nav = convert_eph.load_rinex_nav(str(p))
+    assert float(nav.sel(sv="E36")["DataSrc"].values[0]) == 513.0

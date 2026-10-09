@@ -521,6 +521,10 @@ def parse_rinex3_nav(filepath, systems='GJ'):
                                 np.full((len(time_arr), len(sv_arr)), np.nan))
         sv_idx = {sv: i for i, sv in enumerate(sv_set)}
         time_idx = {t: i for i, t in enumerate(time_set)}
+        # I/NAV and F/NAV records share the epoch; write I/NAV (E1-B or E5b-I,
+        # see _is_inav) last so it wins over F/NAV regardless of file order.
+        gal_records = sorted(gal_records,
+                             key=lambda r: _is_inav(r[2].get('DataSrc') or 0))
         for sv_label, epoch, fields in gal_records:
             si = sv_idx[sv_label]
             ti = time_idx[epoch]
@@ -568,65 +572,78 @@ def parse_rinex3_nav(filepath, systems='GJ'):
         return xr.merge(datasets, join='outer')
 
 
-def _deduplicate_galileo_svs(nav_gal):
-    """Deduplicate Galileo I/NAV vs F/NAV SVs from georinex.
+GAL_INAV_MASK = 0x05  # DataSrc bit 0: I/NAV E1-B, bit 2: I/NAV E5b-I (bit 1: F/NAV E5a-I)
 
-    georinex may produce E01 and E01_1 for I/NAV and F/NAV data.
-    Prefer I/NAV (DataSrc bit 0 set) for correct BGDe5b values.
+
+def _is_inav(datasrc):
+    """True for a Galileo DataSrc value of an I/NAV record (E1-B or E5b-I)."""
+    return not math.isnan(datasrc) and (int(datasrc) & GAL_INAV_MASK) != 0
+
+
+def _inav_mask(ds):
+    """True where the record's DataSrc marks an I/NAV record (E1-B or E5b-I)."""
+    v = np.asarray(ds['DataSrc'].values, dtype=float)
+    out = np.zeros(v.shape, dtype=bool)
+    ok = ~np.isnan(v)
+    out[ok] = (v[ok].astype(np.int64) & GAL_INAV_MASK) != 0
+    return out
+
+
+def _deduplicate_galileo_svs(nav_gal):
+    """Keep one Galileo record per SV and epoch, preferring I/NAV.
+
+    georinex puts a second record with the same epoch (I/NAV and F/NAV are both
+    broadcast) into an extra SV named e.g. E01_1, in file order. That order can
+    change from one epoch to the next, so the choice has to be made per epoch:
+    where the base SV holds F/NAV and the duplicate holds I/NAV, the I/NAV
+    record is taken. Afterwards epochs that only have F/NAV are dropped for SVs
+    that have any I/NAV record, because MGA-GAL-EPH carries the I/NAV clock
+    (E1/E5b) and BGD. SVs with F/NAV data only are kept as they are.
     """
     svs = [str(s) for s in nav_gal.coords['sv'].values]
-    # Find base SVs that have _N duplicates
-    base_svs = set()
+    has_dsrc = 'DataSrc' in nav_gal.data_vars
     suffixed = {}
     for sv in svs:
         if '_' in sv:
-            base = sv.split('_')[0]
-            suffixed[base] = sv
-            base_svs.add(base)
-
-    if not base_svs:
-        return nav_gal  # No duplicates
+            suffixed.setdefault(sv.split('_')[0], []).append(sv)
 
     drop_svs = []
     rename_svs = {}
-    for base in base_svs:
+    for base, dups in suffixed.items():
         if base not in svs:
-            # Base not present, just rename suffixed -> base
-            rename_svs[suffixed[base]] = base
+            rename_svs[dups[0]] = base
+            drop_svs.extend(dups[1:])
             continue
-        # Both base and suffixed exist -- check DataSrc to pick I/NAV
-        base_data = nav_gal.sel(sv=base)
-        suf_data = nav_gal.sel(sv=suffixed[base])
-        # Check DataSrc: bit 0 set = I/NAV (E1-B)
-        base_dsrc = 0
-        suf_dsrc = 0
-        if 'DataSrc' in nav_gal.data_vars:
-            base_vals = base_data['DataSrc'].values
-            suf_vals = suf_data['DataSrc'].values
-            base_dsrc = int(np.nanmean(base_vals[~np.isnan(base_vals)])) if np.any(~np.isnan(base_vals)) else 0
-            suf_dsrc = int(np.nanmean(suf_vals[~np.isnan(suf_vals)])) if np.any(~np.isnan(suf_vals)) else 0
-        if suf_dsrc & 0x01 and not base_dsrc & 0x01:
-            # Suffixed is I/NAV, drop base and rename suffixed
-            drop_svs.append(base)
-            rename_svs[suffixed[base]] = base
-        else:
-            # Base is I/NAV (or both are), drop suffixed
-            drop_svs.append(suffixed[base])
-
-    # Also drop any remaining suffixed SVs without a base
-    for sv in svs:
-        if '_' in sv and sv not in drop_svs and sv not in rename_svs:
-            drop_svs.append(sv)
+        if has_dsrc:
+            merged = nav_gal.sel(sv=base)
+            for dup in dups:
+                other = nav_gal.sel(sv=dup)
+                take = _inav_mask(other) & ~_inav_mask(merged)
+                cond = xr.DataArray(~take, dims=merged['DataSrc'].dims,
+                                    coords={d: merged.coords[d] for d in merged['DataSrc'].dims})
+                merged = merged.where(cond, other)
+            for var in nav_gal.data_vars:
+                if 'sv' in nav_gal[var].dims:
+                    nav_gal[var].loc[{"sv": base}] = merged[var].values
+        drop_svs.extend(dups)
 
     if drop_svs:
-        keep = [sv for sv in svs if sv not in drop_svs]
-        nav_gal = nav_gal.sel(sv=keep)
-
+        nav_gal = nav_gal.sel(sv=[sv for sv in svs if sv not in drop_svs])
     if rename_svs:
-        sv_values = [str(s) for s in nav_gal.coords['sv'].values]
-        new_svs = [rename_svs.get(sv, sv) for sv in sv_values]
-        nav_gal = nav_gal.assign_coords(sv=new_svs)
+        nav_gal = nav_gal.assign_coords(sv=[rename_svs.get(str(sv), str(sv)) for sv in nav_gal.coords['sv'].values])
 
+    if has_dsrc:
+        for sv in [str(s) for s in nav_gal.coords['sv'].values]:
+            d = nav_gal.sel(sv=sv)
+            inav = _inav_mask(d)
+            if inav.any():
+                fnav_only = ~inav & ~np.isnan(np.asarray(d['DataSrc'].values, dtype=float))
+                if fnav_only.any():
+                    for var in nav_gal.data_vars:
+                        if 'sv' in nav_gal[var].dims and np.issubdtype(nav_gal[var].dtype, np.floating):
+                            vals = nav_gal[var].sel(sv=sv).values.copy()
+                            vals[fnav_only] = np.nan
+                            nav_gal[var].loc[{"sv": sv}] = vals
     return nav_gal
 
 
@@ -708,6 +725,8 @@ def load_rinex_nav(filepath):
             nav_gal = _deduplicate_galileo_svs(nav_gal)
         if nav_gal is None:
             nav_gal = parse_rinex3_nav(filepath, systems='E')
+            if nav_gal is not None:
+                nav_gal = _deduplicate_galileo_svs(nav_gal)
         if nav_gal is not None:
             parts.append(nav_gal)
 
