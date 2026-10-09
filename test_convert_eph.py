@@ -2001,7 +2001,8 @@ class TestBuildMgaGalTimeoffset:
         cls_id, msg_id, payload = parse_ubx_frame(msg)
         assert cls_id == 0x13
         assert msg_id == 0x02  # GAL
-        assert len(payload) == 10
+        assert len(payload) == 12
+        assert payload[10:12] == b'\x00\x00'  # reserved1
 
     def test_type_byte(self):
         gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}

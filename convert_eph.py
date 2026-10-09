@@ -1521,7 +1521,7 @@ def build_mga_glo_timeoffset(glut=None, glgp=None, epoch_time=None):
 # ---- Build MGA-GAL-TIMEOFFSET / MGA-GAL-UTC ----
 
 def build_mga_gal_timeoffset(gagp):
-    """Build MGA-GAL-TIMEOFFSET message (class=0x13, id=0x02, 10-byte payload).
+    """Build MGA-GAL-TIMEOFFSET message (class=0x13, id=0x02, 12-byte payload).
 
     Args:
         gagp: dict with 'a0' (Galileo-GPS offset in seconds),
@@ -1538,7 +1538,7 @@ def build_mga_gal_timeoffset(gagp):
     # wn0G: U1, 8-bit week number
     wn0g_raw = gagp['wnt'] & 0xFF
 
-    payload = struct.pack('<BBHhhBB',
+    payload = struct.pack('<BBHhhBBH',
         0x03,           # type
         0x00,           # version
         0x0000,         # reserved0 (U2)
@@ -1546,8 +1546,9 @@ def build_mga_gal_timeoffset(gagp):
         a1g_raw,        # a1G (I2)
         t0g_raw,        # t0G (U1)
         wn0g_raw,       # wn0G (U1)
+        0x0000,         # reserved1 (U2)
     )
-    assert len(payload) == 10, f"Expected 10, got {len(payload)}"
+    assert len(payload) == 12, f"Expected 12, got {len(payload)}"
     return create_ubx_message(0x13, 0x02, payload)
 
 
