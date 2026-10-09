@@ -1232,8 +1232,19 @@ def build_mga_qzss_health(health_map):
 
 # ---- Build MGA-GPS-IONO / MGA-GPS-UTC from RINEX header ----
 
+def _hdr_float(s):
+    s = s.strip().replace('D', 'E').replace('d', 'e')
+    return float(s) if s else 0.0
+
+
 def parse_rinex_header(path):
     """Extract ionospheric, UTC, and leap second parameters from RINEX nav header.
+
+    Handles RINEX 3/4 labels (IONOSPHERIC CORR, TIME SYSTEM CORR, LEAP SECONDS)
+    and RINEX 2 labels (ION ALPHA, ION BETA, DELTA-UTC: A0,A1,T,W, LEAP SECONDS).
+    Blank coefficient fields (e.g. the 4th field of the RINEX 3 GAL line) are
+    read as 0.0, and a malformed line is skipped instead of aborting the whole
+    header.
 
     Returns dict with keys like 'GPSA', 'GPSB', 'GPUT', 'QZSA', 'QZSB', 'QZUT', 'LEAP'.
     """
@@ -1243,22 +1254,25 @@ def parse_rinex_header(path):
             label = line[60:].strip()
             if label == 'END OF HEADER':
                 break
-            if label == 'IONOSPHERIC CORR':
-                key = line[:4].strip()  # GPSA, GPSB, QZSA, QZSB
-                vals = []
-                for i in range(4):
-                    s = line[5 + i*12 : 5 + (i+1)*12].strip().replace('D', 'E')
-                    vals.append(float(s))
-                params[key] = vals
-            elif label == 'TIME SYSTEM CORR':
-                key = line[:4].strip()  # GPUT, QZUT
-                a0 = float(line[5:22].strip().replace('D', 'E'))
-                a1 = float(line[22:38].strip().replace('D', 'E'))
-                t = int(line[38:45].strip())
-                w = int(line[45:50].strip())
-                params[key] = {'a0': a0, 'a1': a1, 'tot': t, 'wnt': w}
-            elif label == 'LEAP SECONDS':
-                params['LEAP'] = int(line[:6])
+            try:
+                if label == 'IONOSPHERIC CORR':
+                    key = line[:4].strip()
+                    params[key] = [_hdr_float(line[5 + i*12 : 5 + (i+1)*12]) for i in range(4)]
+                elif label == 'TIME SYSTEM CORR':
+                    key = line[:4].strip()
+                    params[key] = {'a0': _hdr_float(line[5:22]), 'a1': _hdr_float(line[22:38]),
+                                   'tot': int(line[38:45].strip()), 'wnt': int(line[45:50].strip())}
+                elif label == 'ION ALPHA':
+                    params['GPSA'] = [_hdr_float(line[2 + i*12 : 2 + (i+1)*12]) for i in range(4)]
+                elif label == 'ION BETA':
+                    params['GPSB'] = [_hdr_float(line[2 + i*12 : 2 + (i+1)*12]) for i in range(4)]
+                elif label == 'DELTA-UTC: A0,A1,T,W':
+                    params['GPUT'] = {'a0': _hdr_float(line[3:22]), 'a1': _hdr_float(line[22:41]),
+                                      'tot': int(line[41:50].strip()), 'wnt': int(line[50:59].strip())}
+                elif label == 'LEAP SECONDS':
+                    params['LEAP'] = int(line[:6])
+            except ValueError as e:
+                print(f"  Warning: skipping header line {label!r}: {e}", file=sys.stderr)
     return params
 
 
