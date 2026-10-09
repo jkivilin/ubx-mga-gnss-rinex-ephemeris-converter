@@ -124,3 +124,10 @@ def test_gps_and_gal_utc_leap_event_fields():
         assert p[15] == 2450 & 0xFF and p[16] == 3 and p[17] == 19
         p = build(utc, 18)[6:-2]
         assert p[15] == 0 and p[16] == 0 and p[17] == 18
+
+
+def test_gal_utc_tot_scale():
+    p = convert_eph.build_mga_gal_utc({"a0": 0.0, "a1": 0.0, "tot": 432000, "wnt": 2439}, 18)[6:-2]
+    assert p[13] == 120
+    p = convert_eph.build_mga_gps_utc({"a0": 0.0, "a1": 0.0, "tot": 61440, "wnt": 2440}, 18)[6:-2]
+    assert p[13] == 15

@@ -1661,7 +1661,7 @@ def build_mga_gal_utc(gaut, leap_seconds, leap_future=None):
     a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
     a1_raw = round(gaut['a1'] / 2**-50)
     a1_raw = max(-2**31, min(2**31 - 1, a1_raw))
-    tot_raw = round(gaut['tot'] / 4096) & 0xFF
+    tot_raw = round(gaut['tot'] / 3600) & 0xFF   # Galileo t0t: 3600 s units (GPS uses 4096)
     wnt_raw = gaut['wnt'] & 0xFF
 
     payload = struct.pack('<BB2siibBBBBb2s',
