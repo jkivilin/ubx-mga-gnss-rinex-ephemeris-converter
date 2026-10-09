@@ -20,6 +20,7 @@ import gzip
 import os
 import shutil
 import sys
+import datetime
 import struct
 import math
 import tempfile
@@ -1276,6 +1277,81 @@ def parse_rinex_header(path):
     return params
 
 
+def _gps_week_tow(t):
+    total = (t - datetime.datetime(1980, 1, 6)).total_seconds()
+    return int(total // 604800), int(round(total % 604800))
+
+
+def parse_rinex4_records(path):
+    """Extract STO and ION records from the body of a RINEX 4 nav file.
+
+    RINEX 4 moves system time offsets and ionospheric parameters out of the
+    header into "> STO" and "> ION" records. For each time offset type (GPUT,
+    GAUT, GAGP, GLUT, GLGP, QZUT, ...) and each ionospheric model (GPS and
+    QZSS Klobuchar, Galileo NeQuick) the record with the latest epoch is kept.
+    Returns the same keys as parse_rinex_header(); RINEX 2/3 files give {}.
+    """
+    params = {}
+    newest = {}
+    with open(path) as f:
+        try:
+            if float(f.readline()[:9]) < 4:
+                return params
+        except ValueError:
+            return params
+        lines = f.read().splitlines()
+    i = 0
+    while i < len(lines) and lines[i][60:].strip() != 'END OF HEADER':
+        i += 1
+    i += 1
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith('> '):
+            i += 1
+            continue
+        tok = line[2:].split()
+        rtype = tok[0] if tok else ''
+        sv = tok[1] if len(tok) > 1 else ''
+        body = []
+        j = i + 1
+        while j < len(lines) and not lines[j].startswith('>'):
+            body.append(lines[j])
+            j += 1
+        try:
+            if rtype in ('STO', 'ION') and body:
+                ep = body[0].split()
+                y, mo, d, h, mi = (int(x) for x in ep[:5])
+                sec = float(ep[5])
+                epoch = datetime.datetime(y, mo, d, h, mi) + datetime.timedelta(seconds=sec)
+                if rtype == 'STO' and len(body) >= 2:
+                    code = ep[6]
+                    a0 = _hdr_float(body[1][23:42])
+                    a1 = _hdr_float(body[1][42:61])
+                    wnt, tot = _gps_week_tow(epoch)
+                    if code not in newest or epoch > newest[code]:
+                        newest[code] = epoch
+                        params[code] = {'a0': a0, 'a1': a1, 'tot': tot, 'wnt': wnt}
+                elif rtype == 'ION':
+                    vals = [_hdr_float(body[0][23 + k*19 : 42 + k*19]) for k in range(3)]
+                    for extra in body[1:]:
+                        vals += [_hdr_float(extra[4 + k*19 : 23 + k*19]) for k in range(4)]
+                    sysid = sv[:1]
+                    if sysid in ('G', 'J') and len(vals) >= 8:
+                        a, b = ('GPSA', 'GPSB') if sysid == 'G' else ('QZSA', 'QZSB')
+                        if a not in newest or epoch > newest[a]:
+                            newest[a] = epoch
+                            params[a] = vals[0:4]
+                            params[b] = vals[4:8]
+                    elif sysid == 'E' and len(vals) >= 3:
+                        if 'GAL' not in newest or epoch > newest['GAL']:
+                            newest['GAL'] = epoch
+                            params['GAL'] = (vals + [0.0])[0:4]
+        except (ValueError, IndexError) as e:
+            print(f"  Warning: skipping RINEX 4 {rtype} record for {sv}: {e}", file=sys.stderr)
+        i = j
+    return params
+
+
 def build_mga_gps_iono(gpsa, gpsb):
     """Build MGA-GPS-IONO message (class=0x13, id=0x00, 16-byte payload).
 
@@ -1775,6 +1851,8 @@ Examples:
             # Parse header for iono/UTC parameters
             try:
                 hdr = parse_rinex_header(rinex_path)
+                for key, val in parse_rinex4_records(rinex_path).items():
+                    hdr.setdefault(key, val)
                 all_headers.update(hdr)
             except Exception as e:
                 print(f"  Warning: failed to parse header: {e}", file=sys.stderr)
