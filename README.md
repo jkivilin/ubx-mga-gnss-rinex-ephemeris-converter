@@ -43,7 +43,8 @@ Converts RINEX navigation files to UBX-MGA messages.
 
 - RINEX 2 GPS navigation (`.XXn`) — tested with QZSS site `brdc*.26n`
 - RINEX 2 QZSS navigation (`.XXq`) — tested with QZSS site `brdc*.26q`
-- RINEX 3 mixed multi-GNSS navigation (`.rnx`) — tested with IGS/BKG `BRDC00WRD_R_*.rnx`
+- RINEX 3 mixed multi-GNSS navigation (`.rnx`) — tested with IGS/BKG `BRDC00WRD_R_*.rnx` and IGS station files (`WTZR00DEU_R_*_01H_MN.rnx`)
+- RINEX 4 mixed multi-GNSS navigation (`.rnx`), tested with IGS station files (`CEBR00ESP_R_*_01H_MN.rnx`); UTC, time system corrections and ionosphere parameters are read from the `> STO` and `> ION` records, since RINEX 4 no longer carries them in the header
 
 The tool includes its own RINEX 2 and RINEX 3 parser as a fallback, since georinex cannot decode some RINEX files (e.g. certain QZSS RINEX 2 files and RINEX 3 files with mixed GNSS systems). The built-in parser is used automatically when georinex fails or when the file contains systems that georinex does not handle correctly.
 
@@ -216,7 +217,7 @@ TTFF: 27.3s (3D fix, 14 SVs, hAcc=7.1m)
 - **georinex limitations**: georinex cannot decode some RINEX files, including certain QZSS RINEX 2 navigation files and RINEX 3 mixed navigation files with GLONASS records. The tool includes built-in RINEX 2 and RINEX 3 parsers that are used automatically as a fallback when georinex fails.
 - **RINEX field naming**: georinex uses slightly different field names than standard RINEX documentation. The parser handles both RINEX 2 and 3 naming conventions.
 - **GLONASS ephemeris validity**: GLONASS ephemeris has a shorter validity period (~30 min) than GPS (~4 hours). The epoch selection defaults to 1 hour max age for GLONASS.
-- **Galileo I/NAV vs F/NAV**: Galileo broadcasts on two navigation message types (I/NAV and F/NAV). When georinex produces duplicate SVs with `_1` suffix, the tool automatically deduplicates them, preferring I/NAV data (DataSrc bit 0 set) for correct BGDe5b values.
+- **Galileo I/NAV vs F/NAV**: Galileo broadcasts on two navigation message types (I/NAV and F/NAV). MGA-GAL-EPH carries the I/NAV clock and BGDe5b, so when both are present for an epoch the tool keeps the I/NAV record (DataSrc bit 0, E1-B, or bit 2, E5b-I). The choice is made per epoch, both for the `_1` duplicates georinex produces and in the built-in parser, and F/NAV-only epochs are dropped for satellites that have I/NAV data.
 
 ## Testing
 
@@ -257,7 +258,7 @@ No hardware or network access is required — all tests run offline using constr
 
 - RINEX 2 GPS and QZSS record parsing (real satellite data from `brdc` files)
 - RINEX 3 multi-GNSS record parsing
-- RINEX header parsing (ionosphere, UTC, time system corrections)
+- RINEX header parsing (ionosphere, UTC, time system corrections, leap second fields), RINEX 2 `ION ALPHA`/`ION BETA`/`DELTA-UTC` labels, RINEX 4 `STO`/`ION` records
 - GPS time utilities (week number, day-of-year, epoch calculations)
 - UBX framing and checksum computation
 - URA index lookup table
