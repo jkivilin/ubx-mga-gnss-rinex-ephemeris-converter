@@ -265,3 +265,39 @@ def test_rinex4_inav_wins_over_blank_datasrc(tmp_path):
     p.write_text(HDR4 + "> EPH E36 INAV\n" + GAL_INAV + "> EPH E36 INAV\n" + GAL_BLANK_DSRC)
     nav = convert_eph.load_rinex_nav(str(p))
     assert float(nav.sel(sv="E36")["DataSrc"].values[0]) == 513.0
+
+
+def test_is_inav_edge_values():
+    assert not convert_eph._is_inav(float("nan"))
+    assert not convert_eph._is_inav(0)
+    assert convert_eph._is_inav(4.0) and convert_eph._is_inav(517.0)
+
+
+def test_rinex4_records_with_blank_fields(tmp_path):
+    """Blank or malformed STO/ION fields: the record is skipped, the scan goes on."""
+    body = (
+        "> STO G21 LNAV\n"
+        "    2026 10 10 19 50 24 GPUT                                  UTC(USNO)\n"
+        "     4.752840000000E+05" + " " * 19 + "-1.243449787580E-14 0.000000000000E+00\n"
+        "> STO E19 IFNV\n"
+        "    2026 10 09 00 00 00 GAUT                                  UTCGAL\n"
+        "     4.320000000000E+05 x.xxx 0.000000000000E+00 0.000000000000E+00\n"
+        "> ION G21 LNAV\n"
+        "    2026 10 09 11 59 48 1.955777406693E-08" + " " * 19 + "-1.192092895508E-07\n"
+        "     0.000000000000E+00 1.228800000000E+05-1.638400000000E+04-2.621440000000E+05\n"
+        "     1.966080000000E+05 0.000000000000E+00\n"
+        "> ION E19 IFNV\n"
+        "    2026 10 09 11 59 57\n"
+    )
+    p = tmp_path / "blank.rnx"
+    p.write_text(HDR4 + body)
+    r = convert_eph.parse_rinex4_records(str(p))
+    assert not r
+
+
+def test_leap_seconds_partial_future_fields(tmp_path):
+    path = _write(tmp_path, [("    18    18  1929", "LEAP SECONDS"), ("", "END OF HEADER")])
+    h = convert_eph.parse_rinex_header(path)
+    assert h["LEAP"] == 18 and "LEAP_FUTURE" not in h
+    path = _write(tmp_path, [("    xx", "LEAP SECONDS"), ("    18", "LEAP SECONDS"), ("", "END OF HEADER")])
+    assert convert_eph.parse_rinex_header(path)["LEAP"] == 18

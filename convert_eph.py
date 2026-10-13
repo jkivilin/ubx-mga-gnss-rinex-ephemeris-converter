@@ -1301,6 +1301,14 @@ def parse_rinex_header(path):
     return params
 
 
+def _rec_float(s):
+    """Float from a RINEX 4 record field; a blank field is a truncated record, not 0."""
+    s = s.strip().replace('D', 'E').replace('d', 'e')
+    if not s:
+        raise ValueError('blank field')
+    return float(s)
+
+
 def _gps_week_tow(t):
     total = (t - datetime.datetime(1980, 1, 6)).total_seconds()
     return int(total // 604800), int(round(total % 604800))
@@ -1313,7 +1321,9 @@ def parse_rinex4_records(path):
     header into "> STO" and "> ION" records. For each time offset type (GPUT,
     GAUT, GAGP, GLUT, GLGP, QZUT, ...) and each ionospheric model (GPS and
     QZSS Klobuchar, Galileo NeQuick) the record with the latest epoch is kept.
-    Returns the same keys as parse_rinex_header(); RINEX 2/3 files give {}.
+    A record with a blank or malformed field is skipped with a warning (a blank
+    field means a truncated record, not a zero coefficient). Returns the same
+    keys as parse_rinex_header(); RINEX 2/3 files give {}.
     """
     params = {}
     newest = {}
@@ -1349,16 +1359,19 @@ def parse_rinex4_records(path):
                 epoch = datetime.datetime(y, mo, d, h, mi) + datetime.timedelta(seconds=sec)
                 if rtype == 'STO' and len(body) >= 2:
                     code = ep[6]
-                    a0 = _hdr_float(body[1][23:42])
-                    a1 = _hdr_float(body[1][42:61])
+                    a0 = _rec_float(body[1][23:42])
+                    a1 = _rec_float(body[1][42:61])
                     wnt, tot = _gps_week_tow(epoch)
                     if code not in newest or epoch > newest[code]:
                         newest[code] = epoch
                         params[code] = {'a0': a0, 'a1': a1, 'tot': tot, 'wnt': wnt}
                 elif rtype == 'ION':
-                    vals = [_hdr_float(body[0][23 + k*19 : 42 + k*19]) for k in range(3)]
+                    vals = [_rec_float(body[0][23 + k*19 : 42 + k*19]) for k in range(3)]
                     for extra in body[1:]:
-                        vals += [_hdr_float(extra[4 + k*19 : 23 + k*19]) for k in range(4)]
+                        for k in range(4):
+                            field = extra[4 + k*19 : 23 + k*19]
+                            if field.strip():
+                                vals.append(_rec_float(field))
                     sysid = sv[:1]
                     if sysid in ('G', 'J') and len(vals) >= 8:
                         a, b = ('GPSA', 'GPSB') if sysid == 'G' else ('QZSA', 'QZSB')
