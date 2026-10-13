@@ -28,4 +28,4 @@ jobs:
         run: pytest -v
 
       - name: Run pylint
-        run: pylint convert_eph.py test_convert_eph.py ubx_tool.py test_ubx_tool.py
+        run: pylint convert_eph.py test_convert_eph.py test_header_parsing.py ubx_tool.py test_ubx_tool.py

@@ -2001,7 +2001,8 @@ class TestBuildMgaGalTimeoffset:
         cls_id, msg_id, payload = parse_ubx_frame(msg)
         assert cls_id == 0x13
         assert msg_id == 0x02  # GAL
-        assert len(payload) == 10
+        assert len(payload) == 12
+        assert payload[10:12] == b'\x00\x00'  # reserved1
 
     def test_type_byte(self):
         gagp = {'a0': 0.0, 'a1': 0.0, 'tot': 0, 'wnt': 0}
@@ -2091,11 +2092,11 @@ class TestBuildMgaGalUtc:
         assert dtLS == 18
 
     def test_tot_encoding(self):
-        """utcTot: U1 scaled 2^12 (4096s)."""
-        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 405504, 'wnt': 0}
+        """tot: U1 scaled 3600 s (Galileo t0t), unlike GPS utcTot (4096 s)."""
+        gaut = {'a0': 0.0, 'a1': 0.0, 'tot': 432000, 'wnt': 0}
         msg = convert_eph.build_mga_gal_utc(gaut, 0)
         _, _, payload = parse_ubx_frame(msg)
-        assert payload[13] == 99  # 405504/4096 = 99
+        assert payload[13] == 120  # 432000/3600 = 120
 
     def test_dtlsf_mirrors_dtls(self):
         """Future leap second should equal current."""

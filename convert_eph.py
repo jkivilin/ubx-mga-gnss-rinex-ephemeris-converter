@@ -20,6 +20,7 @@ import gzip
 import os
 import shutil
 import sys
+import datetime
 import struct
 import math
 import tempfile
@@ -520,6 +521,10 @@ def parse_rinex3_nav(filepath, systems='GJ'):
                                 np.full((len(time_arr), len(sv_arr)), np.nan))
         sv_idx = {sv: i for i, sv in enumerate(sv_set)}
         time_idx = {t: i for i, t in enumerate(time_set)}
+        # I/NAV and F/NAV records share the epoch; write I/NAV (E1-B or E5b-I,
+        # see _is_inav) last so it wins over F/NAV regardless of file order.
+        gal_records = sorted(gal_records,
+                             key=lambda r: _is_inav(r[2].get('DataSrc') or 0))
         for sv_label, epoch, fields in gal_records:
             si = sv_idx[sv_label]
             ti = time_idx[epoch]
@@ -567,65 +572,78 @@ def parse_rinex3_nav(filepath, systems='GJ'):
         return xr.merge(datasets, join='outer')
 
 
-def _deduplicate_galileo_svs(nav_gal):
-    """Deduplicate Galileo I/NAV vs F/NAV SVs from georinex.
+GAL_INAV_MASK = 0x05  # DataSrc bit 0: I/NAV E1-B, bit 2: I/NAV E5b-I (bit 1: F/NAV E5a-I)
 
-    georinex may produce E01 and E01_1 for I/NAV and F/NAV data.
-    Prefer I/NAV (DataSrc bit 0 set) for correct BGDe5b values.
+
+def _is_inav(datasrc):
+    """True for a Galileo DataSrc value of an I/NAV record (E1-B or E5b-I)."""
+    return not math.isnan(datasrc) and (int(datasrc) & GAL_INAV_MASK) != 0
+
+
+def _inav_mask(ds):
+    """True where the record's DataSrc marks an I/NAV record (E1-B or E5b-I)."""
+    v = np.asarray(ds['DataSrc'].values, dtype=float)
+    out = np.zeros(v.shape, dtype=bool)
+    ok = ~np.isnan(v)
+    out[ok] = (v[ok].astype(np.int64) & GAL_INAV_MASK) != 0
+    return out
+
+
+def _deduplicate_galileo_svs(nav_gal):
+    """Keep one Galileo record per SV and epoch, preferring I/NAV.
+
+    georinex puts a second record with the same epoch (I/NAV and F/NAV are both
+    broadcast) into an extra SV named e.g. E01_1, in file order. That order can
+    change from one epoch to the next, so the choice has to be made per epoch:
+    where the base SV holds F/NAV and the duplicate holds I/NAV, the I/NAV
+    record is taken. Afterwards epochs that only have F/NAV are dropped for SVs
+    that have any I/NAV record, because MGA-GAL-EPH carries the I/NAV clock
+    (E1/E5b) and BGD. SVs with F/NAV data only are kept as they are.
     """
     svs = [str(s) for s in nav_gal.coords['sv'].values]
-    # Find base SVs that have _N duplicates
-    base_svs = set()
+    has_dsrc = 'DataSrc' in nav_gal.data_vars
     suffixed = {}
     for sv in svs:
         if '_' in sv:
-            base = sv.split('_')[0]
-            suffixed[base] = sv
-            base_svs.add(base)
-
-    if not base_svs:
-        return nav_gal  # No duplicates
+            suffixed.setdefault(sv.split('_')[0], []).append(sv)
 
     drop_svs = []
     rename_svs = {}
-    for base in base_svs:
+    for base, dups in suffixed.items():
         if base not in svs:
-            # Base not present, just rename suffixed -> base
-            rename_svs[suffixed[base]] = base
+            rename_svs[dups[0]] = base
+            drop_svs.extend(dups[1:])
             continue
-        # Both base and suffixed exist -- check DataSrc to pick I/NAV
-        base_data = nav_gal.sel(sv=base)
-        suf_data = nav_gal.sel(sv=suffixed[base])
-        # Check DataSrc: bit 0 set = I/NAV (E1-B)
-        base_dsrc = 0
-        suf_dsrc = 0
-        if 'DataSrc' in nav_gal.data_vars:
-            base_vals = base_data['DataSrc'].values
-            suf_vals = suf_data['DataSrc'].values
-            base_dsrc = int(np.nanmean(base_vals[~np.isnan(base_vals)])) if np.any(~np.isnan(base_vals)) else 0
-            suf_dsrc = int(np.nanmean(suf_vals[~np.isnan(suf_vals)])) if np.any(~np.isnan(suf_vals)) else 0
-        if suf_dsrc & 0x01 and not base_dsrc & 0x01:
-            # Suffixed is I/NAV, drop base and rename suffixed
-            drop_svs.append(base)
-            rename_svs[suffixed[base]] = base
-        else:
-            # Base is I/NAV (or both are), drop suffixed
-            drop_svs.append(suffixed[base])
-
-    # Also drop any remaining suffixed SVs without a base
-    for sv in svs:
-        if '_' in sv and sv not in drop_svs and sv not in rename_svs:
-            drop_svs.append(sv)
+        if has_dsrc:
+            merged = nav_gal.sel(sv=base)
+            for dup in dups:
+                other = nav_gal.sel(sv=dup)
+                take = _inav_mask(other) & ~_inav_mask(merged)
+                cond = xr.DataArray(~take, dims=merged['DataSrc'].dims,
+                                    coords={d: merged.coords[d] for d in merged['DataSrc'].dims})
+                merged = merged.where(cond, other)
+            for var in nav_gal.data_vars:
+                if 'sv' in nav_gal[var].dims:
+                    nav_gal[var].loc[{"sv": base}] = merged[var].values
+        drop_svs.extend(dups)
 
     if drop_svs:
-        keep = [sv for sv in svs if sv not in drop_svs]
-        nav_gal = nav_gal.sel(sv=keep)
-
+        nav_gal = nav_gal.sel(sv=[sv for sv in svs if sv not in drop_svs])
     if rename_svs:
-        sv_values = [str(s) for s in nav_gal.coords['sv'].values]
-        new_svs = [rename_svs.get(sv, sv) for sv in sv_values]
-        nav_gal = nav_gal.assign_coords(sv=new_svs)
+        nav_gal = nav_gal.assign_coords(sv=[rename_svs.get(str(sv), str(sv)) for sv in nav_gal.coords['sv'].values])
 
+    if has_dsrc:
+        for sv in [str(s) for s in nav_gal.coords['sv'].values]:
+            d = nav_gal.sel(sv=sv)
+            inav = _inav_mask(d)
+            if inav.any():
+                fnav_only = ~inav & ~np.isnan(np.asarray(d['DataSrc'].values, dtype=float))
+                if fnav_only.any():
+                    for var in nav_gal.data_vars:
+                        if 'sv' in nav_gal[var].dims and np.issubdtype(nav_gal[var].dtype, np.floating):
+                            vals = nav_gal[var].sel(sv=sv).values.copy()
+                            vals[fnav_only] = np.nan
+                            nav_gal[var].loc[{"sv": sv}] = vals
     return nav_gal
 
 
@@ -707,6 +725,8 @@ def load_rinex_nav(filepath):
             nav_gal = _deduplicate_galileo_svs(nav_gal)
         if nav_gal is None:
             nav_gal = parse_rinex3_nav(filepath, systems='E')
+            if nav_gal is not None:
+                nav_gal = _deduplicate_galileo_svs(nav_gal)
         if nav_gal is not None:
             parts.append(nav_gal)
 
@@ -1232,8 +1252,19 @@ def build_mga_qzss_health(health_map):
 
 # ---- Build MGA-GPS-IONO / MGA-GPS-UTC from RINEX header ----
 
+def _hdr_float(s):
+    s = s.strip().replace('D', 'E').replace('d', 'e')
+    return float(s) if s else 0.0
+
+
 def parse_rinex_header(path):
     """Extract ionospheric, UTC, and leap second parameters from RINEX nav header.
+
+    Handles RINEX 3/4 labels (IONOSPHERIC CORR, TIME SYSTEM CORR, LEAP SECONDS)
+    and RINEX 2 labels (ION ALPHA, ION BETA, DELTA-UTC: A0,A1,T,W, LEAP SECONDS).
+    Blank coefficient fields (e.g. the 4th field of the RINEX 3 GAL line) are
+    read as 0.0, and a malformed line is skipped instead of aborting the whole
+    header.
 
     Returns dict with keys like 'GPSA', 'GPSB', 'GPUT', 'QZSA', 'QZSB', 'QZUT', 'LEAP'.
     """
@@ -1243,22 +1274,118 @@ def parse_rinex_header(path):
             label = line[60:].strip()
             if label == 'END OF HEADER':
                 break
-            if label == 'IONOSPHERIC CORR':
-                key = line[:4].strip()  # GPSA, GPSB, QZSA, QZSB
-                vals = []
-                for i in range(4):
-                    s = line[5 + i*12 : 5 + (i+1)*12].strip().replace('D', 'E')
-                    vals.append(float(s))
-                params[key] = vals
-            elif label == 'TIME SYSTEM CORR':
-                key = line[:4].strip()  # GPUT, QZUT
-                a0 = float(line[5:22].strip().replace('D', 'E'))
-                a1 = float(line[22:38].strip().replace('D', 'E'))
-                t = int(line[38:45].strip())
-                w = int(line[45:50].strip())
-                params[key] = {'a0': a0, 'a1': a1, 'tot': t, 'wnt': w}
-            elif label == 'LEAP SECONDS':
-                params['LEAP'] = int(line[:6])
+            try:
+                if label == 'IONOSPHERIC CORR':
+                    key = line[:4].strip()
+                    params[key] = [_hdr_float(line[5 + i*12 : 5 + (i+1)*12]) for i in range(4)]
+                elif label == 'TIME SYSTEM CORR':
+                    key = line[:4].strip()
+                    params[key] = {'a0': _hdr_float(line[5:22]), 'a1': _hdr_float(line[22:38]),
+                                   'tot': int(line[38:45].strip()), 'wnt': int(line[45:50].strip())}
+                elif label == 'ION ALPHA':
+                    params['GPSA'] = [_hdr_float(line[2 + i*12 : 2 + (i+1)*12]) for i in range(4)]
+                elif label == 'ION BETA':
+                    params['GPSB'] = [_hdr_float(line[2 + i*12 : 2 + (i+1)*12]) for i in range(4)]
+                elif label == 'DELTA-UTC: A0,A1,T,W':
+                    params['GPUT'] = {'a0': _hdr_float(line[3:22]), 'a1': _hdr_float(line[22:41]),
+                                      'tot': int(line[41:50].strip()), 'wnt': int(line[50:59].strip())}
+                elif label == 'LEAP SECONDS':
+                    params['LEAP'] = int(line[:6])
+                    fut = [line[6 + k*6 : 12 + k*6].strip() for k in range(3)]
+                    sysid = line[24:27].strip()
+                    if all(fut) and sysid in ('', 'GPS'):
+                        params['LEAP_FUTURE'] = {'dtlsf': int(fut[0]), 'wnlsf': int(fut[1]),
+                                                 'dn': int(fut[2])}
+            except ValueError as e:
+                print(f"  Warning: skipping header line {label!r}: {e}", file=sys.stderr)
+    return params
+
+
+def _rec_float(s):
+    """Float from a RINEX 4 record field; a blank field is a truncated record, not 0."""
+    s = s.strip().replace('D', 'E').replace('d', 'e')
+    if not s:
+        raise ValueError('blank field')
+    return float(s)
+
+
+def _gps_week_tow(t):
+    total = (t - datetime.datetime(1980, 1, 6)).total_seconds()
+    return int(total // 604800), int(round(total % 604800))
+
+
+def parse_rinex4_records(path):
+    """Extract STO and ION records from the body of a RINEX 4 nav file.
+
+    RINEX 4 moves system time offsets and ionospheric parameters out of the
+    header into "> STO" and "> ION" records. For each time offset type (GPUT,
+    GAUT, GAGP, GLUT, GLGP, QZUT, ...) and each ionospheric model (GPS and
+    QZSS Klobuchar, Galileo NeQuick) the record with the latest epoch is kept.
+    A record with a blank or malformed field is skipped with a warning (a blank
+    field means a truncated record, not a zero coefficient). Returns the same
+    keys as parse_rinex_header(); RINEX 2/3 files give {}.
+    """
+    params = {}
+    newest = {}
+    with open(path) as f:
+        try:
+            if float(f.readline()[:9]) < 4:
+                return params
+        except ValueError:
+            return params
+        lines = f.read().splitlines()
+    i = 0
+    while i < len(lines) and lines[i][60:].strip() != 'END OF HEADER':
+        i += 1
+    i += 1
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith('> '):
+            i += 1
+            continue
+        tok = line[2:].split()
+        rtype = tok[0] if tok else ''
+        sv = tok[1] if len(tok) > 1 else ''
+        body = []
+        j = i + 1
+        while j < len(lines) and not lines[j].startswith('>'):
+            body.append(lines[j])
+            j += 1
+        try:
+            if rtype in ('STO', 'ION') and body:
+                ep = body[0].split()
+                y, mo, d, h, mi = (int(x) for x in ep[:5])
+                sec = float(ep[5])
+                epoch = datetime.datetime(y, mo, d, h, mi) + datetime.timedelta(seconds=sec)
+                if rtype == 'STO' and len(body) >= 2:
+                    code = ep[6]
+                    a0 = _rec_float(body[1][23:42])
+                    a1 = _rec_float(body[1][42:61])
+                    wnt, tot = _gps_week_tow(epoch)
+                    if code not in newest or epoch > newest[code]:
+                        newest[code] = epoch
+                        params[code] = {'a0': a0, 'a1': a1, 'tot': tot, 'wnt': wnt}
+                elif rtype == 'ION':
+                    vals = [_rec_float(body[0][23 + k*19 : 42 + k*19]) for k in range(3)]
+                    for extra in body[1:]:
+                        for k in range(4):
+                            field = extra[4 + k*19 : 23 + k*19]
+                            if field.strip():
+                                vals.append(_rec_float(field))
+                    sysid = sv[:1]
+                    if sysid in ('G', 'J') and len(vals) >= 8:
+                        a, b = ('GPSA', 'GPSB') if sysid == 'G' else ('QZSA', 'QZSB')
+                        if a not in newest or epoch > newest[a]:
+                            newest[a] = epoch
+                            params[a] = vals[0:4]
+                            params[b] = vals[4:8]
+                    elif sysid == 'E' and len(vals) >= 3:
+                        if 'GAL' not in newest or epoch > newest['GAL']:
+                            newest['GAL'] = epoch
+                            params['GAL'] = (vals + [0.0])[0:4]
+        except (ValueError, IndexError) as e:
+            print(f"  Warning: skipping RINEX 4 {rtype} record for {sv}: {e}", file=sys.stderr)
+        i = j
     return params
 
 
@@ -1292,12 +1419,15 @@ def build_mga_gps_iono(gpsa, gpsb):
     return create_ubx_message(0x13, 0x00, payload)
 
 
-def build_mga_gps_utc(gput, leap_seconds):
+def build_mga_gps_utc(gput, leap_seconds, leap_future=None):
     """Build MGA-GPS-UTC message (class=0x13, id=0x00, 20-byte payload).
 
     Args:
         gput: dict with 'a0', 'a1', 'tot' (seconds), 'wnt' (full GPS week)
         leap_seconds: current UTC-GPS leap seconds (int)
+        leap_future: optional dict with 'dtlsf', 'wnlsf' (GPS week), 'dn' from
+            the RINEX 3/4 LEAP SECONDS header line. Without it no leap second
+            change is announced (dtLSF = dtLS, WNlsf = DN = 0).
     Returns:
         bytes: complete UBX message
     """
@@ -1306,7 +1436,7 @@ def build_mga_gps_utc(gput, leap_seconds):
     # utcDtLS: I1, current leap seconds
     # utcTot: U1, scaled 2^12 s (tot / 4096)
     # utcWNt: U1, 8-bit truncated GPS week
-    # utcWNlsf, utcDN, utcDtLSF: future leap second info (not in RINEX)
+    # utcWNlsf, utcDN, utcDtLSF: leap second event (RINEX 3/4 LEAP SECONDS)
     a0_raw = round(gput['a0'] / 2**-30)
     a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
     a1_raw = round(gput['a1'] / 2**-50)
@@ -1314,8 +1444,12 @@ def build_mga_gps_utc(gput, leap_seconds):
     tot_raw = round(gput['tot'] / 4096) & 0xFF
     wnt_raw = gput['wnt'] & 0xFF
 
-    # Future leap second fields: not available in RINEX header.
-    # Set dtLSF = dtLS (no pending change), wnlsf/dn = 0.
+    if leap_future:
+        wnlsf_raw = leap_future['wnlsf'] & 0xFF
+        dn_raw = leap_future['dn'] & 0xFF
+        dtlsf = leap_future['dtlsf']
+    else:
+        wnlsf_raw, dn_raw, dtlsf = 0, 0, leap_seconds
     payload = struct.pack('<BB2siibBBBBb2s',
         0x05,               # type
         0x00,               # version
@@ -1325,9 +1459,9 @@ def build_mga_gps_utc(gput, leap_seconds):
         leap_seconds,       # utcDtLS (I1)
         tot_raw,            # utcTot (U1)
         wnt_raw,            # utcWNt (U1)
-        0,                  # utcWNlsf (U1) -- not in RINEX
-        0,                  # utcDN (U1) -- not in RINEX
-        leap_seconds,       # utcDtLSF (I1) -- same as dtLS (no pending change)
+        wnlsf_raw,          # utcWNlsf (U1)
+        dn_raw,             # utcDN (U1)
+        dtlsf,              # utcDtLSF (I1)
         b'\x00\x00',        # reserved2
     )
     assert len(payload) == 20, f"Expected 20, got {len(payload)}"
@@ -1507,7 +1641,7 @@ def build_mga_glo_timeoffset(glut=None, glgp=None, epoch_time=None):
 # ---- Build MGA-GAL-TIMEOFFSET / MGA-GAL-UTC ----
 
 def build_mga_gal_timeoffset(gagp):
-    """Build MGA-GAL-TIMEOFFSET message (class=0x13, id=0x02, 10-byte payload).
+    """Build MGA-GAL-TIMEOFFSET message (class=0x13, id=0x02, 12-byte payload).
 
     Args:
         gagp: dict with 'a0' (Galileo-GPS offset in seconds),
@@ -1524,7 +1658,7 @@ def build_mga_gal_timeoffset(gagp):
     # wn0G: U1, 8-bit week number
     wn0g_raw = gagp['wnt'] & 0xFF
 
-    payload = struct.pack('<BBHhhBB',
+    payload = struct.pack('<BBHhhBBH',
         0x03,           # type
         0x00,           # version
         0x0000,         # reserved0 (U2)
@@ -1532,12 +1666,13 @@ def build_mga_gal_timeoffset(gagp):
         a1g_raw,        # a1G (I2)
         t0g_raw,        # t0G (U1)
         wn0g_raw,       # wn0G (U1)
+        0x0000,         # reserved1 (U2)
     )
-    assert len(payload) == 10, f"Expected 10, got {len(payload)}"
+    assert len(payload) == 12, f"Expected 12, got {len(payload)}"
     return create_ubx_message(0x13, 0x02, payload)
 
 
-def build_mga_gal_utc(gaut, leap_seconds):
+def build_mga_gal_utc(gaut, leap_seconds, leap_future=None):
     """Build MGA-GAL-UTC message (class=0x13, id=0x02, 20-byte payload).
 
     Args:
@@ -1546,12 +1681,19 @@ def build_mga_gal_utc(gaut, leap_seconds):
     Returns:
         bytes: complete UBX message
     """
-    # Same structure as MGA-GPS-UTC but type=0x05 and id=0x02 (GAL)
+    # Same structure as MGA-GPS-UTC but type=0x05 and id=0x02 (GAL).
+    # The 8-bit WNlsf is the same for GPS and GST weeks (they differ by 1024).
+    if leap_future:
+        wnlsf_raw = leap_future['wnlsf'] & 0xFF
+        dn_raw = leap_future['dn'] & 0xFF
+        dtlsf = leap_future['dtlsf']
+    else:
+        wnlsf_raw, dn_raw, dtlsf = 0, 0, leap_seconds
     a0_raw = round(gaut['a0'] / 2**-30)
     a0_raw = max(-2**31, min(2**31 - 1, a0_raw))
     a1_raw = round(gaut['a1'] / 2**-50)
     a1_raw = max(-2**31, min(2**31 - 1, a1_raw))
-    tot_raw = round(gaut['tot'] / 4096) & 0xFF
+    tot_raw = round(gaut['tot'] / 3600) & 0xFF   # Galileo t0t: 3600 s units (GPS uses 4096)
     wnt_raw = gaut['wnt'] & 0xFF
 
     payload = struct.pack('<BB2siibBBBBb2s',
@@ -1563,9 +1705,9 @@ def build_mga_gal_utc(gaut, leap_seconds):
         leap_seconds,       # utcDtLS (I1)
         tot_raw,            # utcTot (U1)
         wnt_raw,            # utcWNt (U1)
-        0,                  # utcWNlsf (U1)
-        0,                  # utcDN (U1)
-        leap_seconds,       # utcDtLSF (I1)
+        wnlsf_raw,          # utcWNlsf (U1)
+        dn_raw,             # utcDN (U1)
+        dtlsf,              # utcDtLSF (I1)
         b'\x00\x00',        # reserved2
     )
     assert len(payload) == 20, f"Expected 20, got {len(payload)}"
@@ -1760,6 +1902,8 @@ Examples:
             # Parse header for iono/UTC parameters
             try:
                 hdr = parse_rinex_header(rinex_path)
+                for key, val in parse_rinex4_records(rinex_path).items():
+                    hdr.setdefault(key, val)
                 all_headers.update(hdr)
             except Exception as e:
                 print(f"  Warning: failed to parse header: {e}", file=sys.stderr)
@@ -1893,7 +2037,7 @@ Examples:
     # Build UTC message from RINEX header (GPS-UTC time correction)
     if 'GPUT' in all_headers and 'LEAP' in all_headers and 'GPS' in systems:
         extra_messages.append(('GPS-UTC', build_mga_gps_utc(
-            all_headers['GPUT'], all_headers['LEAP'])))
+            all_headers['GPUT'], all_headers['LEAP'], all_headers.get('LEAP_FUTURE'))))
         if args.verbose:
             gput = all_headers['GPUT']
             print(f"  GPS UTC: a0={gput['a0']:.4e} tot={gput['tot']} "
@@ -1933,7 +2077,7 @@ Examples:
         gaut = all_headers.get('GAUT')
         if gaut and 'LEAP' in all_headers:
             extra_messages.append(('GAL-UTC',
-                build_mga_gal_utc(gaut, all_headers['LEAP'])))
+                build_mga_gal_utc(gaut, all_headers['LEAP'], all_headers.get('LEAP_FUTURE'))))
             if args.verbose:
                 print(f"  GAL UTC: a0={gaut['a0']:.4e} tot={gaut['tot']} "
                       f"wnt={gaut['wnt']} leap={all_headers['LEAP']}",
